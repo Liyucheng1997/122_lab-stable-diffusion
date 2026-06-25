@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>本地 AI 生图</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="workspace">
+        <aside class="control-panel" aria-label="生成参数">
+          <div class="brand-row">
+            <div>
+              <h1>本地 AI 生图</h1>
+              <p id="statusText">正在检测环境...</p>
+              <p id="safetyText">默认安全过滤</p>
+            </div>
+            <button id="refreshBtn" class="icon-button" title="刷新状态" type="button">↻</button>
+          </div>
+
+          <form id="generateForm" class="form-stack">
+            <section class="prompt-helper" aria-label="中文提示词优化">
+              <div class="helper-title">
+                <h2>中文提示词优化</h2>
+                <span id="promptHelperStatus">DeepSeek</span>
+              </div>
+              <label>
+                <span>中文描述</span>
+                <textarea id="cnPrompt" rows="4" placeholder="例如：一只机械猫站在雨夜的霓虹街道上，电影感，细节丰富"></textarea>
+              </label>
+              <label>
+                <span>风格补充</span>
+                <input id="promptStyle" placeholder="写实摄影、动漫、赛博朋克、产品图、电影海报..." />
+              </label>
+              <button id="optimizePromptBtn" class="secondary-button full-width" type="button">优化为英文提示词</button>
+              <p id="promptNotes"></p>
+            </section>
+
+            <label>
+              <span>提示词</span>
+              <textarea id="prompt" rows="5" required placeholder="a cinematic portrait, detailed lighting, high quality"></textarea>
+            </label>
+
+            <label>
+              <span>反向提示词</span>
+              <textarea id="negativePrompt" rows="3" placeholder="low quality, blurry, distorted"></textarea>
+            </label>
+
+            <label>
+              <span>模型预设</span>
+              <select id="modelPreset">
+                <option value="stable-diffusion-v1-5/stable-diffusion-v1-5" data-family="sd15">Stable Diffusion 1.5</option>
+                <option value="stabilityai/stable-diffusion-xl-base-1.0" data-family="sdxl">Stable Diffusion XL 1.0</option>
+              </select>
+            </label>
+
+            <label>
+              <span>模型</span>
+              <input id="model" value="stable-diffusion-v1-5/stable-diffusion-v1-5" />
+            </label>
+
+            <div class="two-col">
+              <label>
+                <span>选择 LoRA</span>
+                <select id="loraSelect">
+                  <option value="">不使用 LoRA</option>
+                </select>
+              </label>
+              <label>
+                <span>LoRA 权重</span>
+                <input id="loraScale" type="number" min="-4" max="4" step="0.05" value="0.8" />
+              </label>
+            </div>
+
+            <label>
+              <span>LoRA 路径</span>
+                <input id="loraPath" placeholder="loras/style.safetensors" />
+            </label>
+
+            <div class="grid-controls">
+              <label>
+                <span>宽度</span>
+                <input id="width" type="number" min="256" max="1536" step="8" value="512" />
+              </label>
+              <label>
+                <span>高度</span>
+                <input id="height" type="number" min="256" max="1536" step="8" value="512" />
+              </label>
+              <label>
+                <span>步数</span>
+                <input id="steps" type="number" min="1" max="100" value="25" />
+              </label>
+              <label>
+                <span>CFG</span>
+                <input id="guidanceScale" type="number" min="0" max="30" step="0.1" value="7.5" />
+              </label>
+            </div>
+
+            <label>
+              <span>Seed</span>
+              <input id="seed" type="number" min="0" max="4294967295" placeholder="留空随机" />
+            </label>
+
+            <button id="generateBtn" class="primary-button" type="submit">生成图片</button>
+          </form>
+        </aside>
+
+        <section class="result-panel" aria-label="生成结果">
+          <div class="result-toolbar">
+            <div>
+              <h2>生成结果</h2>
+              <p id="runInfo">图片会保存到项目的 outputs 目录。</p>
+            </div>
+            <a id="downloadLink" class="secondary-button is-disabled" href="#" download>下载最新图片</a>
+          </div>
+
+          <section class="metrics-panel" aria-label="GPU 资源">
+            <div class="metric-card">
+              <div class="metric-title">
+                <h2>实时 GPU</h2>
+                <span id="gpuTimestamp">等待数据</span>
+              </div>
+              <div class="metric-bars">
+                <div class="meter-row">
+                  <div class="meter-label">
+                    <span>显存</span>
+                    <strong id="memoryText">--</strong>
+                  </div>
+                  <div class="meter"><span id="memoryBar"></span></div>
+                </div>
+                <div class="meter-row">
+                  <div class="meter-label">
+                    <span>利用率</span>
+                    <strong id="utilText">--</strong>
+                  </div>
+                  <div class="meter"><span id="utilBar"></span></div>
+                </div>
+              </div>
+              <div class="metric-kpis">
+                <span id="powerText">功耗 --</span>
+                <span id="tempText">温度 --</span>
+                <span id="torchText">Torch 显存 --</span>
+              </div>
+            </div>
+
+            <div class="metric-card">
+              <div class="metric-title">
+                <h2>上一张图</h2>
+                <span id="lastRunState">尚未生成</span>
+              </div>
+              <div class="last-run-grid">
+                <div>
+                  <span>峰值显存</span>
+                  <strong id="lastPeakMemory">--</strong>
+                </div>
+                <div>
+                  <span>新增显存</span>
+                  <strong id="lastMemoryDelta">--</strong>
+                </div>
+                <div>
+                  <span>峰值利用率</span>
+                  <strong id="lastPeakUtil">--</strong>
+                </div>
+                <div>
+                  <span>耗时</span>
+                  <strong id="lastSeconds">--</strong>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <div id="preview" class="preview-area">
+            <div class="empty-state">等待生成</div>
+          </div>
+
+          <div class="history-header">
+            <h2>历史图片</h2>
+          </div>
+          <div id="gallery" class="gallery-grid"></div>
+        </section>
+      </section>
+    </main>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

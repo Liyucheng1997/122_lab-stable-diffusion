@@ -1,0 +1,14 @@
+accelerate>=1.0
+diffusers>=0.35
+fastapi>=0.115
+huggingface-hub>=0.27
+pillow>=10.4
+peft>=0.14
+pydantic>=2.8
+python-dotenv>=1.0
+python-multipart>=0.0.9
+safetensors>=0.4
+sentencepiece>=0.2
+tokenizers>=0.20
+transformers>=4.45
+uvicorn[standard]>=0.30

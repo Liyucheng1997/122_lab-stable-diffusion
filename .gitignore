@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Local environments and secrets
+.venv/
+.env
+.env.*
+!.env.example
+
+# Runtime caches and generated files
+hf_cache/
+hf_lora_downloads/
+logs/
+outputs/
+models/
+
+# Model and adapter weights
+*.safetensors
+*.ckpt
+*.pt
+*.bin
+*.onnx
+
+# Keep LoRA docs, but not downloaded weights
+!loras/README.md
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
