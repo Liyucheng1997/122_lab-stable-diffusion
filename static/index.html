@@ -4,183 +4,265 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>本地 AI 生图</title>
-    <link rel="stylesheet" href="/static/styles.css" />
+    <script>
+      try {
+        var savedTheme = localStorage.getItem("aigen.theme");
+        var dark = savedTheme ? savedTheme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+        document.documentElement.dataset.theme = dark ? "dark" : "light";
+      } catch (e) {}
+    </script>
+    <link rel="stylesheet" href="/static/tokens.css?v=11" />
+    <link rel="stylesheet" href="/static/styles.css?v=11" />
   </head>
   <body>
-    <main class="app-shell">
-      <section class="workspace">
-        <aside class="control-panel" aria-label="生成参数">
-          <div class="brand-row">
-            <div>
-              <h1>本地 AI 生图</h1>
-              <p id="statusText">正在检测环境...</p>
-              <p id="safetyText">默认安全过滤</p>
+    <div id="app">
+      <header class="titlebar">
+        <div class="logo-mark">AI</div>
+        <div class="brand">
+          <div class="brand-name">本地 AI 生图</div>
+          <div id="statusText" class="brand-sub">正在检测环境…</div>
+        </div>
+        <div class="spacer"></div>
+        <div class="status-pill" title="后端状态">
+          <span id="engineDot" class="dot"></span>
+          <span id="engineText">连接中</span>
+        </div>
+        <button id="refreshBtn" class="tb-round" type="button" title="刷新状态、LoRA 和历史图片" data-icon="refresh"></button>
+        <button id="themeBtn" class="tb-round" type="button" title="切换深色 / 浅色" data-icon="moon"></button>
+      </header>
+
+      <div class="workspace">
+        <!-- 左侧：参数 -->
+        <aside class="sidebar" aria-label="生成参数">
+          <form id="generateForm" class="sidebar-form">
+            <div class="sidebar-scroll">
+              <section class="section">
+                <div class="section-head">
+                  <h2 class="section-title">提示词</h2>
+                  <div class="seg" id="promptModeSeg" role="tablist">
+                    <button type="button" data-mode="en" class="active">直接输入</button>
+                    <button type="button" data-mode="cn">中文优化</button>
+                  </div>
+                </div>
+
+                <div id="promptHelper" class="helper" hidden>
+                  <div class="field">
+                    <span class="field-label"><label for="cnPrompt">中文描述</label>
+                      <span class="field-hint"><span id="promptHelperStatus">Claude Opus 5.5</span> · <button id="claudeKeyBtn" class="link-btn" type="button">API Key</button></span>
+                    </span>
+                    <textarea id="cnPrompt" class="input" rows="3" placeholder="例如：一只机械猫站在雨夜的霓虹街道上，电影感，细节丰富"></textarea>
+                  </div>
+                  <label class="field">
+                    <span class="field-label">风格补充</span>
+                    <input id="promptStyle" class="input" placeholder="写实摄影、动漫、赛博朋克、产品图…" />
+                  </label>
+                  <button id="optimizePromptBtn" class="btn btn-ghost-fill" type="button">
+                    <span data-icon="sparkles"></span><span class="btn-text">转写为英文提示词</span>
+                  </button>
+                  <p id="promptNotes" class="helper-notes" hidden></p>
+                </div>
+
+                <div class="stack">
+                  <label class="field">
+                    <span class="field-label">正向提示词</span>
+                    <textarea id="prompt" class="input" rows="4" required placeholder="a cinematic portrait, detailed lighting, high quality"></textarea>
+                  </label>
+                  <label class="field">
+                    <span class="field-label">反向提示词</span>
+                    <textarea id="negativePrompt" class="input" rows="2" placeholder="low quality, blurry, distorted"></textarea>
+                    <span id="negHint" class="field-note" hidden>Z-Image Turbo 用 CFG 0 出图，不读反向提示词；想排除什么，直接写进正向提示词。</span>
+                  </label>
+                </div>
+              </section>
+
+              <section class="section">
+                <div class="section-head">
+                  <h2 class="section-title">模型</h2>
+                  <span id="familyTag" class="tag primary">Z-Image</span>
+                </div>
+                <div class="stack">
+                  <div class="field">
+                    <span class="field-label"><label for="modelPreset">基础模型</label> <button id="modelLibBtn" class="link-btn" type="button">模型详情 · 管理 ›</button></span>
+                    <select id="modelPreset" class="input">
+                      <option value="Tongyi-MAI/Z-Image-Turbo" data-family="zimage">Z-Image Turbo（推荐）</option>
+                      <option value="stable-diffusion-v1-5/stable-diffusion-v1-5" data-family="sd15">Stable Diffusion 1.5</option>
+                      <option value="stabilityai/stable-diffusion-xl-base-1.0" data-family="sdxl">Stable Diffusion XL 1.0</option>
+                      <option value="models/waiREALCN_v150.safetensors" data-family="sdxl">WAI-REAL_CN v15.0（本地 SDXL）</option>
+                      <option value="__custom__">自定义模型…</option>
+                    </select>
+                    <span id="modelNote" class="field-note" hidden></span>
+                  </div>
+                  <div id="modelDownload" class="dl-box" hidden>
+                    <div class="dl-head">
+                      <span id="modelDlText" class="dl-text">这个模型还没下载</span>
+                      <button id="modelDlBtn" class="btn btn-primary btn-sm" type="button">下载模型</button>
+                    </div>
+                    <div class="meter" id="modelDlMeter" hidden><span id="modelDlBar"></span></div>
+                    <span id="modelDlSub" class="field-note"></span>
+                  </div>
+                  <label class="field" id="customModelField" hidden>
+                    <span class="field-label">模型 ID 或路径</span>
+                    <input id="model" class="input" placeholder="Hugging Face ID、本地目录或 .safetensors" />
+                  </label>
+
+                  <div class="field">
+                    <span class="field-label"><label for="loraSelect">LoRA 风格</label> <button id="loraLibBtn" class="link-btn" type="button">LoRA 库 · 管理 ›</button></span>
+                    <select id="loraSelect" class="input">
+                      <option value="">不使用 LoRA</option>
+                    </select>
+                  </div>
+                  <div class="field" id="loraScaleField">
+                    <span class="field-label">LoRA 权重</span>
+                    <div class="slider-row">
+                      <input id="loraScaleRange" type="range" min="0" max="1.5" step="0.05" value="0.8" />
+                      <input id="loraScale" class="input num" type="number" min="-4" max="4" step="0.05" value="0.8" />
+                    </div>
+                  </div>
+                  <p id="loraHint" class="hint" hidden></p>
+                  <p id="zimageLoraNote" class="field-note" hidden>Z-Image 换 LoRA 或改权重时要重新加载模型，第一张图会多等约 1 分钟。</p>
+                  <details class="adv">
+                    <summary>手动指定 LoRA 路径</summary>
+                    <input id="loraPath" class="input" placeholder="loras/style.safetensors" />
+                  </details>
+                </div>
+              </section>
+
+              <section class="section">
+                <div class="section-head">
+                  <h2 class="section-title">画面</h2>
+                  <span id="sizeText" class="tag tabular">1024 × 1024</span>
+                </div>
+                <div class="stack">
+                  <div class="seg seg-block" id="ratioSeg">
+                    <button type="button" data-ratio="1:1">1:1</button>
+                    <button type="button" data-ratio="3:4">3:4</button>
+                    <button type="button" data-ratio="4:3">4:3</button>
+                    <button type="button" data-ratio="9:16">9:16</button>
+                    <button type="button" data-ratio="16:9">16:9</button>
+                  </div>
+                  <div class="size-row">
+                    <label class="field">
+                      <span class="field-label">宽度</span>
+                      <input id="width" class="input tabular" type="number" min="256" max="1536" step="8" value="1024" />
+                    </label>
+                    <span class="size-x">×</span>
+                    <label class="field">
+                      <span class="field-label">高度</span>
+                      <input id="height" class="input tabular" type="number" min="256" max="1536" step="8" value="1024" />
+                    </label>
+                  </div>
+                  <div class="field">
+                    <span class="field-label">步数</span>
+                    <div class="slider-row">
+                      <input id="stepsRange" type="range" min="1" max="60" step="1" value="9" />
+                      <input id="steps" class="input num" type="number" min="1" max="100" value="9" />
+                    </div>
+                  </div>
+                  <div class="field">
+                    <span class="field-label">CFG 引导强度</span>
+                    <div class="slider-row">
+                      <input id="guidanceRange" type="range" min="0" max="15" step="0.5" value="0" />
+                      <input id="guidanceScale" class="input num" type="number" min="0" max="30" step="0.1" value="0" />
+                    </div>
+                  </div>
+                  <p id="paramHint" class="field-note param-hint" hidden>
+                    <span id="paramHintText"></span>
+                    <button id="paramResetBtn" class="link-btn" type="button">恢复推荐</button>
+                  </p>
+                  <label class="field">
+                    <span class="field-label">Seed</span>
+                    <div class="seed-row">
+                      <input id="seed" class="input tabular" type="number" min="0" max="4294967295" placeholder="留空随机" />
+                      <button id="seedRandomBtn" class="icon-btn icon-btn-fill" type="button" title="改回随机" data-icon="shuffle"></button>
+                    </div>
+                  </label>
+                </div>
+              </section>
             </div>
-            <button id="refreshBtn" class="icon-button" title="刷新状态" type="button">↻</button>
-          </div>
 
-          <form id="generateForm" class="form-stack">
-            <section class="prompt-helper" aria-label="中文提示词优化">
-              <div class="helper-title">
-                <h2>中文提示词优化</h2>
-                <span id="promptHelperStatus">DeepSeek</span>
-              </div>
-              <label>
-                <span>中文描述</span>
-                <textarea id="cnPrompt" rows="4" placeholder="例如：一只机械猫站在雨夜的霓虹街道上，电影感，细节丰富"></textarea>
-              </label>
-              <label>
-                <span>风格补充</span>
-                <input id="promptStyle" placeholder="写实摄影、动漫、赛博朋克、产品图、电影海报..." />
-              </label>
-              <button id="optimizePromptBtn" class="secondary-button full-width" type="button">优化为英文提示词</button>
-              <p id="promptNotes"></p>
-            </section>
-
-            <label>
-              <span>提示词</span>
-              <textarea id="prompt" rows="5" required placeholder="a cinematic portrait, detailed lighting, high quality"></textarea>
-            </label>
-
-            <label>
-              <span>反向提示词</span>
-              <textarea id="negativePrompt" rows="3" placeholder="low quality, blurry, distorted"></textarea>
-            </label>
-
-            <label>
-              <span>模型预设</span>
-              <select id="modelPreset">
-                <option value="stable-diffusion-v1-5/stable-diffusion-v1-5" data-family="sd15">Stable Diffusion 1.5</option>
-                <option value="stabilityai/stable-diffusion-xl-base-1.0" data-family="sdxl">Stable Diffusion XL 1.0</option>
-              </select>
-            </label>
-
-            <label>
-              <span>模型</span>
-              <input id="model" value="stable-diffusion-v1-5/stable-diffusion-v1-5" />
-            </label>
-
-            <div class="two-col">
-              <label>
-                <span>选择 LoRA</span>
-                <select id="loraSelect">
-                  <option value="">不使用 LoRA</option>
-                </select>
-              </label>
-              <label>
-                <span>LoRA 权重</span>
-                <input id="loraScale" type="number" min="-4" max="4" step="0.05" value="0.8" />
-              </label>
+            <div class="sidebar-footer">
+              <button id="generateBtn" class="btn btn-primary btn-lg" type="submit">生成图片</button>
+              <div class="kbd-hint">Ctrl + Enter 快速生成</div>
             </div>
-
-            <label>
-              <span>LoRA 路径</span>
-                <input id="loraPath" placeholder="loras/style.safetensors" />
-            </label>
-
-            <div class="grid-controls">
-              <label>
-                <span>宽度</span>
-                <input id="width" type="number" min="256" max="1536" step="8" value="512" />
-              </label>
-              <label>
-                <span>高度</span>
-                <input id="height" type="number" min="256" max="1536" step="8" value="512" />
-              </label>
-              <label>
-                <span>步数</span>
-                <input id="steps" type="number" min="1" max="100" value="25" />
-              </label>
-              <label>
-                <span>CFG</span>
-                <input id="guidanceScale" type="number" min="0" max="30" step="0.1" value="7.5" />
-              </label>
-            </div>
-
-            <label>
-              <span>Seed</span>
-              <input id="seed" type="number" min="0" max="4294967295" placeholder="留空随机" />
-            </label>
-
-            <button id="generateBtn" class="primary-button" type="submit">生成图片</button>
           </form>
         </aside>
 
-        <section class="result-panel" aria-label="生成结果">
-          <div class="result-toolbar">
-            <div>
-              <h2>生成结果</h2>
-              <p id="runInfo">图片会保存到项目的 outputs 目录。</p>
-            </div>
-            <a id="downloadLink" class="secondary-button is-disabled" href="#" download>下载最新图片</a>
-          </div>
-
-          <section class="metrics-panel" aria-label="GPU 资源">
-            <div class="metric-card">
-              <div class="metric-title">
-                <h2>实时 GPU</h2>
-                <span id="gpuTimestamp">等待数据</span>
+        <!-- 右侧：结果 -->
+        <main class="main">
+          <section class="card" aria-label="生成结果">
+            <div class="card-header">
+              <div class="card-heading">
+                <h2 class="card-title">生成结果</h2>
+                <p id="runInfo" class="card-sub">图片会自动保存到 outputs 目录。</p>
               </div>
-              <div class="metric-bars">
-                <div class="meter-row">
-                  <div class="meter-label">
-                    <span>显存</span>
-                    <strong id="memoryText">--</strong>
-                  </div>
-                  <div class="meter"><span id="memoryBar"></span></div>
-                </div>
-                <div class="meter-row">
-                  <div class="meter-label">
-                    <span>利用率</span>
-                    <strong id="utilText">--</strong>
-                  </div>
-                  <div class="meter"><span id="utilBar"></span></div>
-                </div>
-              </div>
-              <div class="metric-kpis">
-                <span id="powerText">功耗 --</span>
-                <span id="tempText">温度 --</span>
-                <span id="torchText">Torch 显存 --</span>
+              <div class="card-actions">
+                <button id="useSeedBtn" class="btn btn-sm" type="button" disabled>固定此 Seed</button>
+                <a id="downloadLink" class="btn btn-sm is-disabled" href="#" download><span data-icon="download"></span>下载</a>
               </div>
             </div>
-
-            <div class="metric-card">
-              <div class="metric-title">
-                <h2>上一张图</h2>
-                <span id="lastRunState">尚未生成</span>
+            <div id="stage" class="stage">
+              <div id="preview" class="stage-content">
+                <div class="empty">
+                  <span data-icon="image" data-size="34"></span>
+                  <p>写好提示词，点「生成图片」</p>
+                </div>
               </div>
-              <div class="last-run-grid">
-                <div>
-                  <span>峰值显存</span>
-                  <strong id="lastPeakMemory">--</strong>
-                </div>
-                <div>
-                  <span>新增显存</span>
-                  <strong id="lastMemoryDelta">--</strong>
-                </div>
-                <div>
-                  <span>峰值利用率</span>
-                  <strong id="lastPeakUtil">--</strong>
-                </div>
-                <div>
-                  <span>耗时</span>
-                  <strong id="lastSeconds">--</strong>
+              <div class="stage-overlay">
+                <div class="spinner"></div>
+                <div id="busyText" class="busy-text tabular">正在生成…</div>
+                <div class="meter busy-meter"><span id="busyBar"></span></div>
+                <div class="busy-sub">首次加载模型会比较久</div>
+              </div>
+            </div>
+            <div id="resultMeta" class="result-meta"></div>
+          </section>
+
+          <section class="card" aria-label="GPU 资源">
+            <div class="card-header">
+              <div class="card-heading">
+                <h2 class="card-title">GPU</h2>
+                <p id="gpuTimestamp" class="card-sub">等待数据</p>
+              </div>
+            </div>
+            <div class="stats">
+              <div class="stat">
+                <div class="stat-label">显存</div>
+                <div id="memoryText" class="stat-value">--</div>
+                <div class="meter"><span id="memoryBar"></span></div>
+              </div>
+              <div class="stat">
+                <div class="stat-label">利用率</div>
+                <div id="utilText" class="stat-value">--</div>
+                <div class="meter"><span id="utilBar"></span></div>
+              </div>
+              <div class="stat">
+                <div class="stat-label">功耗 / 温度</div>
+                <div class="stat-value"><span id="powerText">--</span> <span class="stat-split">/</span> <span id="tempText">--</span></div>
+                <div id="torchText" class="stat-sub">Torch 显存 --</div>
+              </div>
+              <div class="stat">
+                <div class="stat-label">上一张 <span id="lastRunState" class="stat-badge">尚未生成</span></div>
+                <div id="lastSeconds" class="stat-value">--</div>
+                <div class="stat-sub">
+                  峰值 <span id="lastPeakMemory">--</span> · 新增 <span id="lastMemoryDelta">--</span> · 利用率 <span id="lastPeakUtil">--</span>
                 </div>
               </div>
             </div>
           </section>
 
-          <div id="preview" class="preview-area">
-            <div class="empty-state">等待生成</div>
-          </div>
-
-          <div class="history-header">
-            <h2>历史图片</h2>
-          </div>
-          <div id="gallery" class="gallery-grid"></div>
-        </section>
-      </section>
-    </main>
-    <script src="/static/app.js"></script>
+          <section class="card" aria-label="历史图片">
+            <div class="card-header">
+              <div class="card-heading">
+                <h2 class="card-title">历史图片</h2>
+                <p id="galleryCount" class="card-sub">--</p>
+              </div>
+            </div>
+            <div id="gallery" class="gallery"></div>
+          </section>
+        </main>
+      </div>
+    </div>
+    <div id="toastHost" class="toast-host"></div>
+    <script src="/static/app.js?v=11"></script>
   </body>
 </html>

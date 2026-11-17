@@ -44,19 +44,14 @@ py -3.11 -m venv .venv
 http://127.0.0.1:7860
 ```
 
-## DeepSeek 提示词优化
+## Claude 提示词优化
 
-网页支持输入中文描述，调用 DeepSeek 生成更适合 Stable Diffusion 的英文正向/反向提示词。
+网页「提示词 → 中文优化」可以输入中文描述，由 **Claude Opus 5.5** 改写成适合当前模型的提示词：
 
-复制 `.env.example` 为 `.env`，然后填写 DeepSeek Key：
+- Z-Image Turbo：一段自然语言英文描述，不写反向提示词（它在 CFG 0 下不读）
+- SDXL / SD 1.5：逗号分隔的英文短语 + 反向提示词
 
-```text
-DEEPSEEK_API_KEY=sk-your-deepseek-api-key
-DEEPSEEK_API_BASE=https://api.deepseek.com
-DEEPSEEK_MODEL=deepseek-v4-flash
-```
-
-保存后重启服务。API Key 只在后端读取，不会发到浏览器。
+第一次使用时点「设置 API Key」，粘贴在 [Anthropic Console](https://console.anthropic.com/settings/keys) 创建的 Key，网页会先校验再保存到项目的 `.env`（`ANTHROPIC_API_KEY`）。Key 只在后端读取，不会发回浏览器，`.env` 也不会提交到 GitHub。
 
 ## 模型
 
@@ -79,11 +74,31 @@ stable-diffusion-v1-5/stable-diffusion-v1-5
 
 切换到 SDXL 时不要继续使用 SD1.5 LoRA；LoRA 必须和模型基座匹配。
 
-模型缓存固定在项目内：
+所有模型都放在项目的 `models/` 目录：
 
 ```text
-hf_cache/
+models/
+  Z-Image-Turbo/                    diffusers 格式
+  stable-diffusion-xl-base-1.0/
+  stable-diffusion-v1-5/
+  waiREALCN_v150.safetensors        单文件模型
 ```
+
+点 `基础模型` 旁边的「模型详情 · 管理」可以查看每个模型的介绍、优缺点、推荐参数和占用空间，并下载或删除。
+
+## 推荐模型：Z-Image Turbo
+
+`模型` 下拉框里的 **Z-Image Turbo**（阿里通义，6B，Apache-2.0）写实效果明显好于 SD 1.5 / SDXL，能直接理解中文提示词，9 步出图。
+第一次选它时点「下载模型」，约 32.8 GB 会下载到 `models/Z-Image-Turbo/`，网页上能看到进度。16GB 显存的显卡会自动用 CPU offload（显存不够时再加 fp8 权重）运行。
+
+- 推荐参数：1024 × 1024、9 步、CFG 0（切换模型时会自动填好）
+- CFG 为 0 时不使用反向提示词
+- 连不上 Hugging Face 时，在 `.env` 里加 `HF_ENDPOINT=https://hf-mirror.com` 后重启
+
+## LoRA 库
+
+点 `LoRA 风格` 旁边的「浏览 LoRA 库」，可以看到按 Z-Image / SDXL / SD 1.5 分类的知名 LoRA（预览图、简介、触发词、建议权重、许可证），一键下载到 `loras/<模型类型>/`，不需要的可以在那里删除，需要时再下载回来。
+选用时会自动填好权重，并把触发词加到提示词开头。目录定义在 `app/catalog.py`，想加新的 LoRA 往 `LORA_CATALOG` 里加一项即可。
 
 ## LoRA
 
@@ -128,7 +143,7 @@ outputs/
 
 - Python 虚拟环境：`.venv/`
 - PyTorch：CUDA 12.8 wheel，已识别 RTX 5080 Laptop GPU
-- 默认模型：已下载到 `hf_cache/`
+- 默认模型：在 `models/` 目录
 - 测试输出：`outputs/`
 
 这些目录都是本机运行产物，不会提交到 GitHub。

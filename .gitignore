@@ -26,6 +26,8 @@ models/
 
 # Keep LoRA docs, but not downloaded weights
 !loras/README.md
+loras/.previews/
+*.part
 
 # OS/editor noise
 .DS_Store
