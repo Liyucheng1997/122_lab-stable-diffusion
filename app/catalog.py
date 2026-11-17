@@ -334,6 +334,20 @@ LORA_CATALOG: list[dict[str, Any]] = [
         "desc": "像小朋友用蜡笔画出来的稚拙画风。",
         "preview": "images/1764433587842__000003000_1.jpg",
     },
+    {
+        "id": "zit-pornmaster",
+        "name": "Pornmaster 成人内容",
+        "family": "zimage",
+        "repo": "RomixERR/Pornmaster_v1-Z-Images-Turbo",
+        "file": "Pornmaster_v1_000044700.safetensors",
+        "size_mb": 340.2,
+        "license": "Apache-2.0",
+        "trigger": "pronmstr",
+        "weight": 0.8,
+        "tags": ["成人", "NSFW"],
+        "desc": "解锁 Z-Image 的成人（NSFW）内容。作者标注为测试版，效果不太稳定；建议强度 0.7～0.85，效果不够时把步数加到 16 左右。仅用于虚构的成年人。",
+        "preview": "",  # 不显示预览图，避免在 LoRA 库里出现成人图片
+    },
     # ---- SDXL（也适用于 WAI-REAL_CN 等 SDXL 微调模型）----
     {
         "id": "sdxl-pixel-art",
