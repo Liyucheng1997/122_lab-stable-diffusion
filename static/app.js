@@ -158,11 +158,12 @@ const promptInput = $("#prompt");
 const negativeInput = $("#negativePrompt");
 const promptModeSeg = $("#promptModeSeg");
 const promptHelper = $("#promptHelper");
-const cnPrompt = $("#cnPrompt");
-const promptStyle = $("#promptStyle");
-const optimizePromptBtn = $("#optimizePromptBtn");
 const promptHelperStatus = $("#promptHelperStatus");
-const promptNotes = $("#promptNotes");
+const agentThread = $("#agentThread");
+const agentInput = $("#agentInput");
+const agentSendBtn = $("#agentSendBtn");
+const agentNewBtn = $("#agentNewBtn");
+const agentAuto = $("#agentAuto");
 const modelPreset = $("#modelPreset");
 const modelInput = $("#model");
 const customModelField = $("#customModelField");
@@ -566,8 +567,6 @@ function saveForm() {
     ...formPayload(),
     prompt: promptInput.value,
     negative_prompt: negativeInput.value,
-    cn: cnPrompt.value,
-    style: promptStyle.value,
     mode: promptMode(),
     count: readCount(),
     // 新选的参考图还只在浏览器里（data URL 太大不存），生成过一次、服务器存下后才记住
@@ -602,9 +601,7 @@ function restoreForm() {
     return;
   }
   applyParams(saved);
-  cnPrompt.value = saved.cn || "";
-  promptStyle.value = saved.style || "";
-  setPromptMode(saved.mode || "en");
+  setPromptMode(saved.mode === "en" ? "en" : saved.mode ? "agent" : "en"); // 旧版存的 "cn" 也算助手模式
 }
 
 function setPair(numberInput, rangeInput, value) {
@@ -772,62 +769,168 @@ function promptMode() {
 }
 function setPromptMode(mode) {
   for (const btn of $$("button", promptModeSeg)) btn.classList.toggle("active", btn.dataset.mode === mode);
-  promptHelper.hidden = mode !== "cn";
+  promptHelper.hidden = mode !== "agent";
+  if (mode === "agent") agentThread.scrollTop = agentThread.scrollHeight;
 }
 promptModeSeg.addEventListener("click", (event) => {
   const btn = event.target.closest("button[data-mode]");
   if (!btn) return;
   setPromptMode(btn.dataset.mode);
-  if (btn.dataset.mode === "cn") cnPrompt.focus();
+  if (btn.dataset.mode === "agent") agentInput.focus();
   saveForm();
 });
 
-async function optimizePrompt() {
-  const text = cnPrompt.value.trim();
-  if (!text) {
-    toast("先写一句中文描述", "error");
-    cnPrompt.focus();
+/* ---------------- AI 助手（多轮对话，助手写提示词并决定出图参数） ---------------- */
+const AGENT_KEY = "aigen.agent.v1";
+// messages：{ role: "user", content: 显示的原话, sent: 发给模型的话（前面可能带系统记录） }
+//           { role: "assistant", turn: 助手这一轮的提示词和参数, result: 出图结果说明 }
+// pending：上一轮的出图结果，下次用户说话时附在前面告诉助手（它要靠这个选 seed）
+let agent = { messages: [], pending: "" };
+let agentBusy = false;
+
+function saveAgent() {
+  store.set(AGENT_KEY, { ...agent, auto: agentAuto.checked });
+}
+
+function restoreAgent() {
+  const saved = store.get(AGENT_KEY, null);
+  if (saved && Array.isArray(saved.messages)) {
+    agent = { messages: saved.messages, pending: saved.pending || "" };
+    agentAuto.checked = saved.auto !== false;
+  }
+  renderAgent();
+}
+
+function agentPlanTags(turn) {
+  return [
+    turn.aspect,
+    `${turn.count} 张`,
+    `${turn.steps} 步`,
+    turn.guidance_scale > 0 ? `CFG ${turn.guidance_scale}` : null,
+    turn.seed == null ? "Seed 随机" : `Seed ${turn.seed}`,
+  ].filter(Boolean);
+}
+
+function renderAgent() {
+  if (!agent.messages.length && !agentBusy) {
+    agentThread.innerHTML = `<p class="agent-empty">说说想要什么画面，助手会写好提示词，自己定比例、张数和 Seed 然后出图。不满意就接着说怎么改，它记得前面的每一版。</p>`;
     return;
   }
-  optimizePromptBtn.disabled = true;
-  $(".btn-text", optimizePromptBtn).textContent = "转写中…";
+  const html = agent.messages.map((m) => {
+    if (m.role === "user") return `<div class="agent-msg user">${escapeHtml(m.content)}</div>`;
+    const turn = m.turn;
+    const plan = turn.generate ? `<div class="agent-plan">${agentPlanTags(turn).map((t) => `<span class="tag">${escapeHtml(t)}</span>`).join("")}</div>` : "";
+    const result = m.result ? `<div class="agent-result">${escapeHtml(m.result)}</div>` : "";
+    return `<div class="agent-msg bot">${escapeHtml(turn.reply)}${plan}${result}</div>`;
+  });
+  if (agentBusy) html.push(`<div class="agent-msg bot typing"><span class="spinner"></span>思考中…</div>`);
+  agentThread.innerHTML = html.join("");
+  agentThread.scrollTop = agentThread.scrollHeight;
+}
+
+// 把助手定的提示词和参数填进左边的表单
+function applyAgentPlan(turn) {
+  promptInput.value = turn.prompt;
+  negativeInput.value = turn.negative_prompt || "";
+  if (SIZES[familyOf(currentModel())][turn.aspect]) applyRatio(turn.aspect);
+  setPair(stepsInput, stepsRange, turn.steps);
+  setPair(guidanceInput, guidanceRange, turn.guidance_scale);
+  seedInput.value = turn.seed == null ? "" : turn.seed;
+  setPair(countInput, countRange, turn.count);
+  updateParamHint();
+  updateStrengthNote();
+  updateCountNote();
+  saveForm();
+}
+
+// 出完图后记下结果：显示在助手那条消息下面，并在用户下次说话时告诉助手
+function agentNoteGeneration(seeds, prompt, strength) {
+  const last = agent.messages[agent.messages.length - 1];
+  if (!seeds.length || promptMode() !== "agent" || last?.role !== "assistant") return;
+  // 左边放了参考图时出的是图生图，画面会被参考图带着走，要让用户和助手都知道
+  const ref = strength ? `（图生图：按参考图重绘，幅度 ${strength}）` : "";
+  const text = `已出图 ${seeds.length} 张，seed：${seeds.join("、")}${ref}`;
+  last.result = text;
+  agent.pending = `上一轮${text}`;
+  if (prompt !== last.turn.prompt) agent.pending += `。出图前用户把提示词手动改成了：${prompt}`;
+  renderAgent();
+  saveAgent();
+}
+
+async function sendAgent() {
+  const text = agentInput.value.trim();
+  if (!text || agentBusy) return;
+  if (isBusy) {
+    toast("正在出图，等这批出完再说");
+    return;
+  }
+  const pending = agent.pending;
+  agent.messages.push({ role: "user", content: text, sent: pending ? `[系统记录：${pending}]\n${text}` : text });
+  agent.pending = "";
+  agentInput.value = "";
+  agentBusy = true;
   llmBusy = true;
-  // 模型不在显存里时（刚出过图）要先加载几秒
-  promptHelperStatus.textContent = llmSettings?.state === "ready" ? "本地模型转写中…" : "本地模型加载并转写中…";
-  promptNotes.hidden = true;
+  agentSendBtn.disabled = true;
+  // 刚出过图时模型不在显存里，要先加载几秒
+  promptHelperStatus.textContent = llmSettings?.state === "ready" ? "助手思考中…" : "加载本地模型并思考中…";
+  renderAgent();
+  let turn = null;
   try {
-    const response = await fetch("/api/prompt/optimize", {
+    const response = await fetch("/api/agent/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text, style: promptStyle.value.trim(), target_model: currentModel() }),
+      body: JSON.stringify({
+        messages: agent.messages.map((m) => (m.role === "user" ? { role: "user", content: m.sent } : { role: "assistant", turn: m.turn })),
+        target_model: currentModel(),
+      }),
     });
     const data = await response.json();
-    if (!response.ok) throw new Error(data.detail || "提示词优化失败");
-    promptInput.value = data.prompt || "";
-    // Z-Image 不用反向提示词，返回空时也清掉旧的，避免误会
-    negativeInput.value = data.negative_prompt || (familyOf(currentModel()) === "zimage" ? "" : negativeInput.value);
-    promptHelperStatus.textContent = `已完成 · ${data.model || "本地模型"}`;
-    promptNotes.textContent = data.notes || "";
-    promptNotes.hidden = !data.notes;
-    saveForm();
-    toast("已写入英文提示词", "success");
+    if (!response.ok) {
+      const detail = Array.isArray(data.detail) ? data.detail.map((d) => d.msg).join("；") : data.detail;
+      throw new Error(detail || "助手没有回应");
+    }
+    turn = data;
+    agent.messages.push({ role: "assistant", turn });
   } catch (error) {
-    promptHelperStatus.textContent = "转写失败";
-    promptNotes.textContent = error.message || "提示词优化失败。";
-    promptNotes.hidden = false;
-    toast("提示词优化失败", "error");
+    // 没发成功：把这句话退回输入框，对话保持原样
+    agent.messages.pop();
+    agent.pending = pending;
+    agentInput.value = text;
+    toast(error.message || "助手没有回应", "error", 4000);
   } finally {
+    agentBusy = false;
     llmBusy = false;
-    optimizePromptBtn.disabled = false;
-    $(".btn-text", optimizePromptBtn).textContent = "转写为英文提示词";
+    agentSendBtn.disabled = false;
+    renderAgent();
+    saveAgent();
+    refreshSettings().catch(() => {});
   }
+  if (!turn?.generate) return;
+  applyAgentPlan(turn);
+  if (agentAuto.checked) await runGeneration();
+  else toast("提示词和参数已填好，点「生成图片」", "success", 3500);
 }
-optimizePromptBtn.addEventListener("click", optimizePrompt);
+
+agentSendBtn.addEventListener("click", sendAgent);
+agentInput.addEventListener("keydown", (event) => {
+  // Enter 发送，Shift + Enter 换行；输入法选字时的回车不算
+  if (event.key !== "Enter" || event.shiftKey || event.ctrlKey || event.metaKey || event.isComposing) return;
+  event.preventDefault();
+  sendAgent();
+});
+agentNewBtn.addEventListener("click", () => {
+  if (agentBusy) return;
+  agent = { messages: [], pending: "" };
+  renderAgent();
+  saveAgent();
+  agentInput.focus();
+});
+agentAuto.addEventListener("change", saveAgent);
 
 /* ---------------- 本地 LLM 状态 ---------------- */
 let llmSettings = null;
 let llmBusy = false;
-const LLM_STATE_TEXT = { ready: "已就绪", loading: "加载中…", stopped: "待命，点转写时自动加载", missing: "不可用" };
+const LLM_STATE_TEXT = { ready: "已就绪", loading: "加载中…", stopped: "待命，发消息时自动加载", missing: "不可用" };
 
 async function refreshSettings() {
   const response = await fetch("/api/settings");
@@ -951,8 +1054,13 @@ async function requestGenerate(payload) {
   return data;
 }
 
-form.addEventListener("submit", async (event) => {
+form.addEventListener("submit", (event) => {
   event.preventDefault();
+  runGeneration();
+});
+
+// 按表单当前的参数出图（点「生成图片」和 AI 助手自动出图都走这里）
+async function runGeneration() {
   if (isBusy) return;
   const base = formPayload();
   if (!base.prompt) {
@@ -976,6 +1084,7 @@ form.addEventListener("submit", async (event) => {
   setBusy(true);
   let done = 0;
   let totalSeconds = 0;
+  const seeds = [];
   try {
     // 多张是一张一张地生成：显存占用不变，每张有自己的 Seed，出一张显示一张
     for (let i = 0; i < count && !stopRequested; i += 1) {
@@ -985,6 +1094,7 @@ form.addEventListener("submit", async (event) => {
       const payload = { ...base, seed: base.seed == null ? null : (base.seed + i) % 2 ** 32 };
       const data = await requestGenerate(payload);
       done += 1;
+      seeds.push(data.seed);
       totalSeconds += Number(data.seconds) || 0;
       engine.loadedModel = payload.model;
       if (data.init_image) {
@@ -1021,8 +1131,9 @@ form.addEventListener("submit", async (event) => {
   } finally {
     batch = null;
     setBusy(false);
+    agentNoteGeneration(seeds, base.prompt, usedRef ? base.strength : null);
   }
-});
+}
 
 stopBatchBtn.addEventListener("click", () => {
   stopRequested = true;
@@ -1998,6 +2109,7 @@ form.addEventListener("change", saveForm);
 hydrateIcons();
 applyThemeIcon();
 restoreForm();
+restoreAgent();
 resetPreview();
 refreshAll();
 setInterval(refreshGpu, 1000);

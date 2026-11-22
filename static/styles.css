@@ -66,7 +66,21 @@ select.input { cursor: pointer; }
 .adv .input { margin-top: 8px; }
 
 .helper { display: flex; flex-direction: column; gap: 10px; padding: 12px; margin-bottom: 14px; border-radius: var(--r); background: var(--panel-2); animation: riseIn 0.25s var(--ease-out); }
-.helper-notes { font-size: 12px; line-height: 1.55; color: var(--text-2); overflow-wrap: anywhere; }
+/* ---------- AI 助手对话 ---------- */
+.agent-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; }
+.agent-thread { display: flex; flex-direction: column; gap: 8px; max-height: 340px; overflow-y: auto; overscroll-behavior: contain; }
+.agent-empty { font-size: 12px; line-height: 1.65; color: var(--text-3); }
+.agent-msg { max-width: 92%; padding: 8px 12px; border-radius: 14px; font-size: 13px; line-height: 1.55; overflow-wrap: anywhere; white-space: pre-wrap; animation: riseIn 0.2s var(--ease-out); }
+.agent-msg.user { align-self: flex-end; background: var(--primary); color: #fff; border-bottom-right-radius: 5px; }
+.agent-msg.bot { align-self: flex-start; background: var(--panel); color: var(--text); border-bottom-left-radius: 5px; }
+.agent-msg.typing { display: flex; align-items: center; gap: 8px; color: var(--text-3); }
+.agent-msg.typing .spinner { width: 13px; height: 13px; border-width: 2px; }
+.agent-plan { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 7px; }
+.agent-plan .tag { height: 20px; padding: 0 8px; font-size: 11px; }
+.agent-result { margin-top: 6px; font-size: 11px; color: var(--text-3); font-variant-numeric: tabular-nums; }
+.agent-input { display: flex; align-items: flex-end; gap: 8px; }
+.agent-input .btn { flex: none; height: 34px; padding: 0 14px; }
+.agent-auto { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-2); }
 
 /* 分段控件 */
 .seg { display: inline-flex; padding: 3px; border-radius: 99px; background: var(--fill); }

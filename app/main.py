@@ -87,10 +87,15 @@ class DownloadRequest(BaseModel):
     id: str = Field(min_length=1, max_length=200)
 
 
-class PromptOptimizeRequest(BaseModel):
-    text: str = Field(min_length=1, max_length=2000)
-    style: str = Field(default="", max_length=500)
-    target_model: str = Field(default="", max_length=300)  # 模型 ID，用来判断提示词格式
+class AgentMessage(BaseModel):
+    role: str = Field(pattern=r"^(user|assistant)$")
+    content: str = Field(default="", max_length=8000)  # 用户说的话
+    turn: dict[str, Any] | None = None  # 助手那一轮返回的完整结果（提示词和参数）
+
+
+class AgentChatRequest(BaseModel):
+    messages: list[AgentMessage] = Field(min_length=1, max_length=200)
+    target_model: str = Field(default="", max_length=300)  # 模型 ID，用来判断提示词写法和参数范围
 
 
 # 模型加载和出图都在独立的工作进程里（app/engine.py），这里只管调度
@@ -426,15 +431,19 @@ def loras() -> dict[str, list[dict[str, Any]]]:
     return {"loras": _lora_records()}
 
 
-@app.post("/api/prompt/optimize")
-def optimize_prompt(request: PromptOptimizeRequest) -> dict[str, Any]:
+@app.post("/api/agent/chat")
+def agent_chat(request: AgentChatRequest) -> dict[str, Any]:
     model_id = request.target_model.strip() or DEFAULT_MODEL
     preset = catalog.model_by_id(model_id)
     label = preset["label"] if preset else model_id
+    messages = [
+        {"role": m.role, "content": prompt_ai.turn_as_history(m.turn) if m.role == "assistant" and m.turn else m.content}
+        for m in request.messages
+    ]
     # 和出图互斥：LLM 和生图模型同时算会把 16GB 显存挤爆。先让生图模型把显存让出来（权重留在内存里，不用重新加载）
     with generation_lock:
         worker.park()
-        return prompt_ai.optimize(request.text, request.style, catalog.family_of_model(model_id), label)
+        return prompt_ai.chat(messages, catalog.family_of_model(model_id), label)
 
 
 @app.get("/api/settings")

@@ -12,7 +12,7 @@
       } catch (e) {}
     </script>
     <link rel="stylesheet" href="/static/tokens.css?v=13" />
-    <link rel="stylesheet" href="/static/styles.css?v=16" />
+    <link rel="stylesheet" href="/static/styles.css?v=17" />
   </head>
   <body>
     <div id="app">
@@ -41,31 +41,27 @@
                   <h2 class="section-title">提示词</h2>
                   <div class="seg" id="promptModeSeg" role="tablist">
                     <button type="button" data-mode="en" class="active">直接输入</button>
-                    <button type="button" data-mode="cn">中文优化</button>
+                    <button type="button" data-mode="agent">AI 助手</button>
                   </div>
                 </div>
 
-                <div id="promptHelper" class="helper" hidden>
-                  <div class="field">
-                    <span class="field-label"><label for="cnPrompt">中文描述</label>
-                      <span class="field-hint"><span id="promptHelperStatus">本地模型</span></span>
-                    </span>
-                    <textarea id="cnPrompt" class="input" rows="3" placeholder="例如：一只机械猫站在雨夜的霓虹街道上，电影感，细节丰富"></textarea>
+                <div id="promptHelper" class="helper agent" hidden>
+                  <div class="agent-head">
+                    <span id="promptHelperStatus" class="field-hint">本地模型</span>
+                    <button id="agentNewBtn" class="link-btn" type="button">新对话</button>
                   </div>
-                  <label class="field">
-                    <span class="field-label">风格补充</span>
-                    <input id="promptStyle" class="input" placeholder="写实摄影、动漫、赛博朋克、产品图…" />
-                  </label>
-                  <button id="optimizePromptBtn" class="btn btn-ghost-fill" type="button">
-                    <span data-icon="sparkles"></span><span class="btn-text">转写为英文提示词</span>
-                  </button>
-                  <p id="promptNotes" class="helper-notes" hidden></p>
+                  <div id="agentThread" class="agent-thread" aria-live="polite"></div>
+                  <div class="agent-input">
+                    <textarea id="agentInput" class="input" rows="2" placeholder="描述想要的画面，或者说怎么改…"></textarea>
+                    <button id="agentSendBtn" class="btn btn-primary" type="button">发送</button>
+                  </div>
+                  <label class="agent-auto"><input id="agentAuto" type="checkbox" checked /> 助手定好参数后自动出图</label>
                 </div>
 
                 <div class="stack">
                   <label class="field">
                     <span class="field-label">正向提示词</span>
-                    <textarea id="prompt" class="input" rows="4" required placeholder="a cinematic portrait, detailed lighting, high quality"></textarea>
+                    <textarea id="prompt" class="input" rows="4" required placeholder="Z-Image 可以直接写中文；SDXL / SD 1.5 用英文短语"></textarea>
                   </label>
                   <label class="field">
                     <span class="field-label">反向提示词</span>
@@ -306,6 +302,6 @@
       </div>
     </div>
     <div id="toastHost" class="toast-host"></div>
-    <script src="/static/app.js?v=16"></script>
+    <script src="/static/app.js?v=18"></script>
   </body>
 </html>

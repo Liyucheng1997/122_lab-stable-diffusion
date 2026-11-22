@@ -38,8 +38,8 @@ def _port() -> int:
 
 
 def _ctx() -> int:
-    # 改写提示词用不了多少上下文，开小一点省显存
-    return int(os.environ.get("LOCAL_LLM_CTX", "8192"))
+    # 要装下系统提示词和多轮对话历史（历史过长时 prompt_ai 会从头裁掉）
+    return int(os.environ.get("LOCAL_LLM_CTX", "16384"))
 
 
 def autostart_enabled() -> bool:
@@ -199,11 +199,11 @@ class LocalLLM:
             state = "ready" if self._ready else "loading"
         return {"available": True, "state": state, "model": model_label(), "detail": ""}
 
-    def chat_json(self, system: str, user: str, schema: dict[str, Any], max_tokens: int = 1024) -> str:
-        """发一轮对话，要求按 JSON Schema 输出，返回模型写的 JSON 文本。"""
+    def chat_json(self, system: str, messages: list[dict[str, str]], schema: dict[str, Any], max_tokens: int = 1024) -> str:
+        """带着整段对话历史请求下一轮回复，要求按 JSON Schema 输出，返回模型写的 JSON 文本。"""
         self.ensure_ready()
         payload = {
-            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            "messages": [{"role": "system", "content": system}, *messages],
             "temperature": 0.7,
             "top_p": 0.95,
             "top_k": 64,
