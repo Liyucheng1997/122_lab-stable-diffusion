@@ -91,6 +91,17 @@ class AgentMessage(BaseModel):
     role: str = Field(pattern=r"^(user|assistant)$")
     content: str = Field(default="", max_length=8000)  # 用户说的话
     turn: dict[str, Any] | None = None  # 助手那一轮返回的完整结果（提示词和参数）
+    image: str = Field(default="", max_length=400)  # 用户这句话附的参考图（/outputs/ 下的地址）
+    image_mode: str = Field(default="", pattern=r"^(ref|describe|)$")  # 参考图用法：ref 图生图 / describe 只提取提示词
+
+
+class ImageBatchRequest(BaseModel):
+    batch: str = Field(min_length=1, max_length=40, pattern=r"^[A-Za-z0-9_-]+$")
+    names: list[str] = Field(min_length=1, max_length=400)
+
+
+class RefImageRequest(BaseModel):
+    image: str = Field(min_length=1, max_length=40_000_000)  # data URL，或 /outputs/ 下的图片地址
 
 
 class AgentChatRequest(BaseModel):
@@ -262,7 +273,22 @@ def _image_records() -> list[dict[str, str]]:
                 "created_at": datetime.fromtimestamp(mtime).isoformat(timespec="seconds"),
             }
         )
-    return records
+    # 同一组（同一段对话，或同一次手动生成）的图收在一起，哪怕中间穿插出过别的图：
+    # 各组之间按组里最新的那张排，新的在前；组内按出图的先后排（第 1 张在最前），和对话里看到的顺序一致
+    members: dict[str, list[dict[str, str]]] = {}
+    for record in records:
+        if record["group"]:
+            members.setdefault(record["group"], []).append(record)
+    ordered: list[dict[str, str]] = []
+    placed: set[str] = set()
+    for record in records:
+        group = record["group"]
+        if not group:
+            ordered.append(record)
+        elif group not in placed:
+            placed.add(group)
+            ordered.extend(reversed(members[group]))
+    return ordered
 
 
 def _guess_lora_family(lora_path: Path) -> str | None:
@@ -436,14 +462,50 @@ def agent_chat(request: AgentChatRequest) -> dict[str, Any]:
     model_id = request.target_model.strip() or DEFAULT_MODEL
     preset = catalog.model_by_id(model_id)
     label = preset["label"] if preset else model_id
-    messages = [
-        {"role": m.role, "content": prompt_ai.turn_as_history(m.turn) if m.role == "assistant" and m.turn else m.content}
-        for m in request.messages
-    ]
+    messages: list[dict[str, Any]] = []
+    for m in request.messages:
+        if m.role == "assistant":
+            messages.append({"role": "assistant", "content": prompt_ai.turn_as_history(m.turn) if m.turn else m.content})
+            continue
+        image_path: Path | None = None
+        missing = False
+        if m.image.startswith("/outputs/"):
+            try:
+                image_path = _store_init_image(m.image)
+            except HTTPException:
+                missing = True  # 参考图已经被删掉：告诉模型这里曾有图，对话照常继续
+        messages.append({"role": "user", "content": m.content, "image": image_path, "image_mode": m.image_mode, "image_missing": missing})
     # 和出图互斥：LLM 和生图模型同时算会把 16GB 显存挤爆。先让生图模型把显存让出来（权重留在内存里，不用重新加载）
     with generation_lock:
         worker.park()
         return prompt_ai.chat(messages, catalog.family_of_model(model_id), label)
+
+
+@app.post("/api/images/batch")
+def set_image_batch(request: ImageBatchRequest) -> dict[str, Any]:
+    """把几张已有的图归到同一组（网页用它把旧对话里出的图补归到各自的对话下）。"""
+    changed = 0
+    for name in request.names:
+        try:
+            metadata_path = _resolve_output_image(name).with_suffix(".json")
+        except HTTPException:
+            continue  # 图已经删了
+        try:
+            meta = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.exists() else {}
+        except (OSError, json.JSONDecodeError):
+            meta = {}
+        if not isinstance(meta, dict) or meta.get("batch") == request.batch:
+            continue
+        meta["batch"] = request.batch
+        metadata_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        changed += 1
+    return {"changed": changed, "images": _image_records()}
+
+
+@app.post("/api/refs")
+def upload_ref(request: RefImageRequest) -> dict[str, str]:
+    """把对话里附的参考图存到 outputs/refs/，返回它的地址（对话历史里只记地址，不存图片数据）。"""
+    return {"url": f"/outputs/refs/{_store_init_image(request.image).name}"}
 
 
 @app.get("/api/settings")

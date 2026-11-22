@@ -5,17 +5,23 @@
 
 from __future__ import annotations
 
+import base64
+import io
 import json
+import re
+from pathlib import Path
 from typing import Any
 
 from fastapi import HTTPException
 from pydantic import BaseModel, ValidationError
 
-from app.local_llm import llm, model_label
+from app.local_llm import llm, mmproj_path, model_label
 
 ASPECTS = ["1:1", "3:4", "4:3", "9:16", "16:9"]
 MAX_COUNT = 4
 HISTORY_CHAR_BUDGET = 12000  # 历史太长时从最早的几轮开始丢，留出上下文给新一轮
+MAX_HISTORY_IMAGES = 2  # 只把最近几张参考图真正发给模型，更早的用一句话代替（每张图要占几百 token）
+VISION_MAX_SIDE = 1024  # 发给模型看的图长边压到这么大
 
 
 class AgentTurn(BaseModel):
@@ -28,6 +34,27 @@ class AgentTurn(BaseModel):
     seed: int
     steps: int
     guidance_scale: float
+    use_reference: bool
+    strength: float
+    variants: list[str]
+
+
+# 用户话里明说的张数（"出一张""来3张"）。前面是"第/这/那…"的不算，那是在指某一张图
+_COUNT_WORDS = {"一": 1, "两": 2, "二": 2, "俩": 2, "三": 3, "四": 4, "1": 1, "2": 2, "3": 3, "4": 4}
+_COUNT_RE = re.compile(r"(?<![第这那上前后哪每\d])([一两二俩三四1-4])\s*张")
+
+
+# 没给数字、但明显想要不止一张的说法
+_SEVERAL_RE = re.compile(r"几张|多张|多来|多出|几种|几个(版本|方案|角度|构图)|一批|一组|多个(版本|方案|角度)|不同(角度|构图|版本|方案|风格)")
+
+
+def requested_count(text: str) -> int | None:
+    """从用户这句话里读出他要几张：说了数字就是那个数；没说也没表示要多张就是 1；只说"多来几张"返回 None，交给模型定。"""
+    own_words = "\n".join(line for line in text.splitlines() if not line.startswith("["))  # 去掉系统记录那几行
+    match = _COUNT_RE.search(own_words)
+    if match:
+        return _COUNT_WORDS[match.group(1)]
+    return None if _SEVERAL_RE.search(own_words) else 1
 
 
 TURN_SCHEMA: dict[str, Any] = {
@@ -42,8 +69,11 @@ TURN_SCHEMA: dict[str, Any] = {
         "seed": {"type": "integer"},
         "steps": {"type": "integer"},
         "guidance_scale": {"type": "number"},
+        "use_reference": {"type": "boolean"},
+        "strength": {"type": "number"},
+        "variants": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["reply", "generate", "prompt", "negative_prompt", "aspect", "count", "seed", "steps", "guidance_scale"],
+    "required": ["reply", "generate", "prompt", "negative_prompt", "aspect", "count", "seed", "steps", "guidance_scale", "use_reference", "strength", "variants"],
     "additionalProperties": False,
 }
 
@@ -59,9 +89,18 @@ SYSTEM_PROMPT = """你是本地 AI 生图工具里的出图助手。用户用中
 - prompt：完整的提示词。每次都给完整版，不是只写改动的部分。generate 为 false 时原样沿用上一版，没有上一版就留空。
 - negative_prompt：反向提示词，写法见上面的模型说明。
 - aspect：画面比例。用户指定了就按用户的；否则按内容选：人像、全身、手机壁纸用 3:4 或 9:16，风景、建筑、电影感场景用 16:9 或 4:3，头像、单个物品、图标用 1:1。修改上一版时保持比例不变，除非用户要求换。
-- count：出几张，1 到 {max_count}。用户指定了就按用户的；全新的想法出 2 到 4 张，让他挑构图；只是微调上一版时出 1 到 2 张。
+- count：出几张，1 到 {max_count}。用户说了几张就是几张，一张也不能多。他没说张数时只出 1 张；他说"多来几张""给我几种方案""换一批"这类话但没给数字时出 2 到 3 张。
+- variants：count 大于 1 时，给每张图各写一句不一样的补充（15 到 40 字），数量等于 count，让这几张有看得出的区别，例如不同的机位角度、景别、光线或摆放位置；这句话会接在 prompt 后面一起用。count 为 1 时是空数组。同一个 prompt 只换 seed 出的图往往几乎一样，所以多张时一定要写。
 - seed：随机种子，-1 表示随机。用户想保留上一张的构图、只改局部（例如"保持不变，只把裙子换成红色"）时，填系统记录里那张图的 seed，画面会尽量保持原样；想换构图、换一批、或者是全新的想法时填 -1。
 - steps、guidance_scale：按上面模型说明里的范围选。
+- use_reference：出图时要不要把参考图当底图重绘（图生图）。对话里用户没附过图时一律为 false。
+- strength：use_reference 为 true 时的重绘幅度，0.3 到 0.9，越小越像原图。幅度太低时画面几乎不会变。只微调细节（表情、光线、质感）用 0.45 到 0.55；换颜色、换衣服、换掉某个物体用 0.6 到 0.7；换画风用 0.7 到 0.8；换背景、换环境、把白底图里的物体放进某个场景用 0.9（低于 0.85 时背景基本还是原来的样子，出不来场景）。用户说"没变化""没有场景感"就调高，说"不像原图了"就调低。use_reference 为 false 时填 0.6。
+
+用户附了参考图时：先仔细看图。图里是商品或某个物体时，把它的外形逐项写进 prompt：整体形状和比例、有几层或几个部件、正面和侧面各有什么（门、盖子、开孔、把手、凸起线条的形状和位置）、材质、透明度和颜色，不要只写一个笼统的名字。把物体放进新场景时，还要把场景写具体：地点、地面和墙面、周围有哪些东西、物体放在哪里、光从哪来。这种改动幅度大，重绘后物体的细节会和原图有出入，在 reply 里如实告诉用户。
+参考图有两种用法，用户消息里方括号的"参考图用法"写明了他选的是哪一种，照着做：
+- 图生图（默认）：把这张图当底图重绘，use_reference 为 true 并选合适的 strength。prompt 仍然要完整描述改完之后的整个画面（图里看到的主体、姿势、服装、环境、构图、光线、色彩、画风都写进去，再加上用户要的改动），不能只写改动。他没说要改什么时，照原图描述，strength 用 0.6。
+- 只提取提示词：只看图写提示词，不用它当底图，use_reference 为 false。同样把图里的内容完整写进 prompt，靠提示词还原画面，aspect 选最接近原图的。
+之后的轮次里参考图仍然有效，use_reference 沿用上一轮的值：他说"再像原图一点"就调低 strength，说"变化不够"就调高；只有他明确说"不要参考图了""不用原图"时才把 use_reference 改成 false，他说"用原图""按原图来"时改回 true。
 
 修改规则：用户说改哪里就只改哪里，提示词其余部分一字不动地保留。用户消息开头方括号里的"系统记录"是工具自动写的出图结果（出了几张、各自的 seed），不是用户说的话，用来帮你选 seed。
 
@@ -104,17 +143,58 @@ def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
-def _conversation(messages: list[dict[str, str]]) -> list[dict[str, str]]:
+def _image_data_url(path: Path) -> str:
+    """把参考图压小、转成 JPEG 的 data URL，发给模型看。"""
+    from PIL import Image
+
+    with Image.open(path) as source:
+        image = source.convert("RGB")
+    image.thumbnail((VISION_MAX_SIDE, VISION_MAX_SIDE), Image.Resampling.LANCZOS)
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=90)
+    return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def _attach_images(conversation: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """把带参考图的用户消息换成「图 + 文字」的多模态内容。"""
+    with_image = [m for m in conversation if m.get("image")]
+    recent = {id(m) for m in with_image[-MAX_HISTORY_IMAGES:]}
+    result: list[dict[str, Any]] = []
+    for message in conversation:
+        content: Any = message["content"]
+        if message.get("image") and id(message) in recent:
+            content = [
+                {"type": "image_url", "image_url": {"url": _image_data_url(message["image"])}},
+                {"type": "text", "text": content},
+            ]
+        elif message.get("image") or message.get("image_missing"):
+            content = f"[这里用户附过一张参考图，现在不再显示]\n{content}"
+        if message.get("image") and message.get("image_mode"):
+            usage = "图生图，把这张图当底图重绘" if message["image_mode"] == "ref" else "只提取提示词，不用它当底图"
+            note = f"[参考图用法：{usage}]"
+            if isinstance(content, list):
+                content[-1]["text"] = f"{note}\n{content[-1]['text']}"
+            else:
+                content = f"{note}\n{content}"
+        result.append({"role": message["role"], "content": content})
+    return result
+
+
+def _conversation(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """整理成 user / assistant 严格交替、以 user 开头和结尾的对话，并把过长的历史从头裁掉。"""
-    merged: list[dict[str, str]] = []
+    merged: list[dict[str, Any]] = []
     for message in messages:
         content = message["content"].strip()
-        if not content:
+        image = message.get("image")
+        if not content and not image:
             continue
         if merged and merged[-1]["role"] == message["role"]:
-            merged[-1]["content"] += "\n\n" + content
+            merged[-1]["content"] = (merged[-1]["content"] + "\n\n" + content).strip()
+            merged[-1]["image"] = image or merged[-1].get("image")
+            merged[-1]["image_mode"] = (image and message.get("image_mode")) or merged[-1].get("image_mode")
+            merged[-1]["image_missing"] = message.get("image_missing") or merged[-1].get("image_missing")
         else:
-            merged.append({"role": message["role"], "content": content})
+            merged.append({"role": message["role"], "content": content, "image": image, "image_mode": message.get("image_mode"), "image_missing": message.get("image_missing")})
     while merged and merged[0]["role"] != "user":
         merged.pop(0)
     if not merged or merged[-1]["role"] != "user":
@@ -125,14 +205,34 @@ def _conversation(messages: list[dict[str, str]]) -> list[dict[str, str]]:
     return merged
 
 
-def chat(messages: list[dict[str, str]], family: str, model_label_target: str) -> dict[str, Any]:
+def chat(messages: list[dict[str, Any]], family: str, model_label_target: str) -> dict[str, Any]:
     family = family if family in FAMILY_GUIDE else "sdxl"
     system = SYSTEM_PROMPT.format(model_label=model_label_target, family_guide=FAMILY_GUIDE[family], max_count=MAX_COUNT)
-    raw = llm.chat_json(system, _conversation(messages), TURN_SCHEMA, max_tokens=2000)
+    conversation = _conversation(messages)
+    has_image = any(m.get("image") for m in conversation)
+    if has_image and not mmproj_path():
+        raise HTTPException(status_code=503, detail="本地 LLM 没有视觉模块（models/ 里缺 mmproj-*.gguf），看不了参考图。")
+    raw = llm.chat_json(system, _attach_images(conversation), TURN_SCHEMA, max_tokens=2000)
     try:
         turn = AgentTurn.model_validate_json(raw)
     except ValidationError as exc:
         raise HTTPException(status_code=502, detail="助手没有返回完整结果，再发一次试试。") from exc
+
+    use_reference = turn.use_reference
+    last = conversation[-1]
+    if last.get("image") and last.get("image_mode"):
+        # 这句话带着新的参考图：用不用它当底图是用户在界面上选的，不靠模型猜
+        use_reference = last["image_mode"] == "ref"
+
+    # 换场景 / 换背景时重绘幅度不能低：实测 0.6 背景还是原图的白底，0.9 才出得来场景
+    own_words = "\n".join(line for line in last["content"].splitlines() if not line.startswith("["))
+    strength = _clamp(turn.strength, 0.2, 0.95)
+    if use_reference and re.search(r"场景|背景|环境|放在|放到|摆在|摆到", own_words):
+        strength = max(strength, 0.9)
+
+    # 张数：说了几张就是几张，没说就 1 张，都不靠模型自己定；只有"多来几张"这种才听模型的（至少 2 张）
+    count = requested_count(last["content"]) or int(_clamp(turn.count, 2, MAX_COUNT))
+    variants = [v.strip() for v in turn.variants if v.strip()][:count] if count > 1 else []
 
     min_steps, max_steps, min_cfg, max_cfg = PARAM_LIMITS[family]
     prompt = turn.prompt.strip()
@@ -143,10 +243,14 @@ def chat(messages: list[dict[str, str]], family: str, model_label_target: str) -
         "prompt": prompt,
         "negative_prompt": "" if family == "zimage" else turn.negative_prompt.strip(),
         "aspect": turn.aspect if turn.aspect in ASPECTS else "1:1",
-        "count": int(_clamp(turn.count, 1, MAX_COUNT)),
+        "count": count,
+        "variants": variants,
         "seed": turn.seed % 2**32 if turn.seed >= 0 else None,
         "steps": int(_clamp(turn.steps, min_steps, max_steps)),
         "guidance_scale": round(_clamp(turn.guidance_scale, min_cfg, max_cfg), 1),
+        # 对话里没有（还在的）参考图时，没法图生图
+        "use_reference": use_reference and has_image,
+        "strength": round(strength, 2),
         "model": f"{model_label()} · 本地",
     }
 
@@ -165,6 +269,9 @@ def turn_as_history(turn: dict[str, Any]) -> str:
             "seed": -1 if seed is None else seed,
             "steps": turn.get("steps", 9),
             "guidance_scale": turn.get("guidance_scale", 0),
+            "use_reference": bool(turn.get("use_reference")),
+            "strength": turn.get("strength", 0.6),
+            "variants": turn.get("variants") or [],
         },
         ensure_ascii=False,
     )

@@ -62,6 +62,18 @@ def model_path() -> Path | None:
     return models[0] if models else None
 
 
+def mmproj_path() -> Path | None:
+    """视觉模块（让模型能看图）：LOCAL_LLM_MMPROJ 指定的文件，没指定就用 models/ 里第一个 mmproj*.gguf。"""
+    raw = os.environ.get("LOCAL_LLM_MMPROJ", "").strip().strip('"')
+    if raw:
+        path = Path(raw)
+        if not path.is_absolute():
+            path = _llm_dir() / path
+        return path if path.is_file() else None
+    found = sorted(p for p in (_llm_dir() / "models").glob("*.gguf") if p.name.lower().startswith("mmproj"))
+    return found[0] if found else None
+
+
 def model_label() -> str:
     path = model_path()
     if not path:
@@ -129,6 +141,8 @@ class LocalLLM:
                 "-c", str(_ctx()), "-np", "1",
                 "--host", "127.0.0.1", "--port", str(_port()),
             ]
+            if mmproj_path():
+                command += ["--mmproj", str(mmproj_path())]
             self._proc = subprocess.Popen(
                 command,
                 cwd=str(_llm_dir()),
@@ -190,16 +204,16 @@ class LocalLLM:
     def view(self) -> dict[str, Any]:
         reason = _missing_reason()
         if reason:
-            return {"available": False, "state": "missing", "model": model_label(), "detail": reason}
+            return {"available": False, "state": "missing", "model": model_label(), "detail": reason, "vision": False}
         if not self.alive():
             state = "stopped"
         else:
             if not self._ready and self._healthy(0.3):
                 self._ready = True
             state = "ready" if self._ready else "loading"
-        return {"available": True, "state": state, "model": model_label(), "detail": ""}
+        return {"available": True, "state": state, "model": model_label(), "detail": "", "vision": mmproj_path() is not None}
 
-    def chat_json(self, system: str, messages: list[dict[str, str]], schema: dict[str, Any], max_tokens: int = 1024) -> str:
+    def chat_json(self, system: str, messages: list[dict[str, Any]], schema: dict[str, Any], max_tokens: int = 1024) -> str:
         """带着整段对话历史请求下一轮回复，要求按 JSON Schema 输出，返回模型写的 JSON 文本。"""
         self.ensure_ready()
         payload = {

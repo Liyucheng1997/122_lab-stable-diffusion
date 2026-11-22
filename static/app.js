@@ -35,6 +35,9 @@ const ICONS = {
   left: '<path d="m15 18-6-6 6-6"/>',
   external: '<path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>',
   right: '<path d="m9 18 6-6-6-6"/>',
+  plus: '<path d="M12 5v14"/><path d="M5 12h14"/>',
+  sidebar: '<rect x="3" y="4" width="18" height="16" rx="3"/><path d="M9 4v16"/>',
+  up: '<path d="M12 19V5"/><path d="m5 12 7-7 7 7"/>',
 };
 
 function icon(name, size = 16) {
@@ -164,6 +167,18 @@ const agentInput = $("#agentInput");
 const agentSendBtn = $("#agentSendBtn");
 const agentNewBtn = $("#agentNewBtn");
 const agentAuto = $("#agentAuto");
+const chatList = $("#chatList");
+const railToggleBtn = $("#railToggleBtn");
+const paramsToggleBtn = $("#paramsToggleBtn");
+const composerModel = $("#composerModel");
+const composerRef = $("#composerRef");
+const composerAttach = $("#composerAttach");
+const composerAttachImg = $("#composerAttachImg");
+const composerAttachBtn = $("#composerAttachBtn");
+const composerAttachClear = $("#composerAttachClear");
+const agentFile = $("#agentFile");
+const attachModeSeg = $("#attachModeSeg");
+const attachModeNote = $("#attachModeNote");
 const modelPreset = $("#modelPreset");
 const modelInput = $("#model");
 const customModelField = $("#customModelField");
@@ -563,6 +578,7 @@ function readCount() {
 }
 
 function saveForm() {
+  updateComposerChips();
   store.set(FORM_KEY, {
     ...formPayload(),
     prompt: promptInput.value,
@@ -596,12 +612,13 @@ function applyParams(params, { includeSeed = true } = {}) {
 function restoreForm() {
   const saved = store.get(FORM_KEY, null);
   if (!saved) {
-    // 第一次打开：默认 Z-Image Turbo + 推荐参数（HTML 里已经填好 1024 / 9 步 / CFG 0）
+    // 第一次打开：默认 Z-Image Turbo + 推荐参数（HTML 里已经填好 1024 / 9 步 / CFG 0），从 AI 助手开始
     setModel(modelPreset.value);
+    setPromptMode("agent");
     return;
   }
   applyParams(saved);
-  setPromptMode(saved.mode === "en" ? "en" : saved.mode ? "agent" : "en"); // 旧版存的 "cn" 也算助手模式
+  setPromptMode(["en", "gallery"].includes(saved.mode) ? saved.mode : "agent");
 }
 
 function setPair(numberInput, rangeInput, value) {
@@ -648,6 +665,7 @@ function loadImage(src) {
 
 function renderRef() {
   const on = !!refImage;
+  composerRef.hidden = !on;
   refDrop.hidden = on;
   refBox.hidden = !on;
   strengthField.hidden = !on;
@@ -760,15 +778,18 @@ document.addEventListener("paste", (event) => {
   const file = Array.from(event.clipboardData?.files || []).find((f) => f.type.startsWith("image/"));
   if (!file) return;
   event.preventDefault();
-  useRefFile(file);
+  if (promptMode() === "agent") agentAttachFile(file);
+  else useRefFile(file);
 });
 
-/* ---------------- 提示词模式 ---------------- */
+/* ---------------- 三个页签：AI 助手（对话） / 手动出图（表单） / 历史画廊 ---------------- */
+const PARAMS_KEY = "aigen.params.open";
 function promptMode() {
-  return $("button.active", promptModeSeg)?.dataset.mode || "en";
+  return $("button.active", promptModeSeg)?.dataset.mode || "agent";
 }
 function setPromptMode(mode) {
   for (const btn of $$("button", promptModeSeg)) btn.classList.toggle("active", btn.dataset.mode === mode);
+  document.body.dataset.mode = { agent: "agent", gallery: "gallery" }[mode] || "manual";
   promptHelper.hidden = mode !== "agent";
   if (mode === "agent") agentThread.scrollTop = agentThread.scrollHeight;
 }
@@ -780,59 +801,302 @@ promptModeSeg.addEventListener("click", (event) => {
   saveForm();
 });
 
+// 助手模式下参数面板默认收起，点「参数」或输入框下面的模型标签打开
+function setParamsOpen(open) {
+  document.body.classList.toggle("params-open", open);
+  paramsToggleBtn.setAttribute("aria-pressed", String(open));
+  store.set(PARAMS_KEY, open);
+}
+paramsToggleBtn.addEventListener("click", () => setParamsOpen(!document.body.classList.contains("params-open")));
+composerModel.addEventListener("click", () => {
+  setParamsOpen(true);
+  modelPreset.scrollIntoView({ block: "center" });
+  modelPreset.focus();
+});
+composerRef.addEventListener("click", () => {
+  setParamsOpen(true);
+  refBox.scrollIntoView({ block: "center" });
+});
+
+// 输入框下面的标签：当前模型（带 LoRA 时注明）和是否放了参考图
+function updateComposerChips() {
+  const lora = loraPathInput.value.trim();
+  composerModel.textContent = `${modelLabel(currentModel())}${lora ? " · LoRA" : ""}`;
+  composerRef.hidden = !refImage;
+}
+
 /* ---------------- AI 助手（多轮对话，助手写提示词并决定出图参数） ---------------- */
-const AGENT_KEY = "aigen.agent.v1";
-// messages：{ role: "user", content: 显示的原话, sent: 发给模型的话（前面可能带系统记录） }
-//           { role: "assistant", turn: 助手这一轮的提示词和参数, result: 出图结果说明 }
-// pending：上一轮的出图结果，下次用户说话时附在前面告诉助手（它要靠这个选 seed）
-let agent = { messages: [], pending: "" };
+const AGENT_KEY = "aigen.agent.v2";
+const AGENT_KEY_V1 = "aigen.agent.v1";
+const RAIL_KEY = "aigen.rail.open";
+const AGENT_SUGGESTS = [
+  "雨夜的霓虹街道上，一只机械猫回头看镜头",
+  "穿汉服的女孩站在竹林里，清晨有薄雾",
+  "一张咖啡店的新品海报，上面写着“秋日限定”",
+  "雪山下的小木屋，窗户透出暖光",
+];
+// 对话记录：每段对话单独保存，「新对话」只是另开一段，旧的留在左侧列表里
+// 一段对话 = { id, updated, messages, pending, usedRef }
+//   messages：{ role: "user", content: 显示的原话, sent: 发给模型的话（前面可能带系统记录）, image, imageMode }
+//             { role: "assistant", turn: 这一轮的提示词和参数, images: [{ url, seed, w, h }], result, error,
+//               local: 用户按表单手动出的图（只显示，不发给模型）, open: 提示词是否展开 }
+//   pending：上一轮的出图结果，下次用户说话时附在前面告诉助手（它要靠这个选 seed）
+const MAX_CHATS = 60;
+let chats = []; // 所有有内容的对话
+let agent = newChat(); // 当前这段对话（还没说话的新对话不进 chats）
 let agentBusy = false;
+let agentRun = null; // 正在出图的那一轮 { msg, count, done }
+let agentProgressText = "";
+
+function newChat() {
+  return { id: `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`, updated: Date.now(), messages: [], pending: "", grouped: true };
+}
 
 function saveAgent() {
-  store.set(AGENT_KEY, { ...agent, auto: agentAuto.checked });
+  if (agent.messages.length && !chats.includes(agent)) chats.push(agent);
+  chats.sort((a, b) => b.updated - a.updated);
+  chats = chats.slice(0, MAX_CHATS);
+  store.set(AGENT_KEY, { current: agent.id, auto: agentAuto.checked, chats });
+  renderChatList();
 }
 
 function restoreAgent() {
   const saved = store.get(AGENT_KEY, null);
-  if (saved && Array.isArray(saved.messages)) {
-    agent = { messages: saved.messages, pending: saved.pending || "" };
+  if (saved && Array.isArray(saved.chats)) {
+    chats = saved.chats.filter((c) => c && Array.isArray(c.messages) && c.messages.length);
+    agent = chats.find((c) => c.id === saved.current) || newChat();
     agentAuto.checked = saved.auto !== false;
+  } else {
+    // 旧版只存一段对话：搬过来当第一条记录
+    const old = store.get(AGENT_KEY_V1, null);
+    if (old && Array.isArray(old.messages) && old.messages.length) {
+      agent = { ...newChat(), messages: old.messages, pending: old.pending || "", usedRef: !!old.usedRef };
+      chats = [agent];
+      agentAuto.checked = old.auto !== false;
+    }
   }
+  setParamsOpen(store.get(PARAMS_KEY, false) === true);
+  // 对话记录栏：宽屏默认展开并记住上次的选择，窄屏默认收起
+  setRailOpen(window.innerWidth > 900 && store.get(RAIL_KEY, true) !== false, { remember: false });
+  updateComposerChips();
   renderAgent();
+  renderChatList();
+  regroupOldChats();
 }
+
+// 历史画廊里按这个编号把同一段对话的图收进一个图片夹
+function chatBatch(chat) {
+  return `chat-${chat.id}`;
+}
+const isChatGroup = (key) => String(key).startsWith("chat-");
+
+// 改成按对话归组之前出的图还带着旧的批次号：对每段旧对话补归一次
+async function regroupOldChats() {
+  let changed = false;
+  for (const chat of chats) {
+    if (chat.grouped) continue;
+    const names = chat.messages.flatMap((m) => (m.images || []).map((img) => img.url.split("/").pop()));
+    if (names.length) {
+      try {
+        const response = await fetch("/api/images/batch", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ batch: chatBatch(chat), names }),
+        });
+        if (!response.ok) continue;
+        const data = await response.json();
+        if (data.changed) {
+          images = data.images || images;
+          renderGallery();
+        }
+      } catch {
+        continue;
+      }
+    }
+    chat.grouped = true;
+    changed = true;
+  }
+  if (changed) saveAgent();
+}
+
+function chatTitle(chat) {
+  const first = chat.messages.find((m) => m.role === "user");
+  return first?.content?.trim() || "手动出图";
+}
+
+function chatTimeLabel(time) {
+  const date = new Date(time);
+  const now = new Date();
+  const hm = `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+  if (date.toDateString() === now.toDateString()) return `今天 ${hm}`;
+  return `${date.getMonth() + 1}月${date.getDate()}日 ${hm}`;
+}
+
+function renderChatList() {
+  if (!chats.length) {
+    chatList.innerHTML = `<p class="rail-empty">还没有对话记录。<br />每段对话都会留在这里，随时可以回来接着改。</p>`;
+    return;
+  }
+  chatList.innerHTML = chats
+    .map((chat) => {
+      const shots = chat.messages.reduce((n, m) => n + (m.images?.length || 0), 0);
+      const sub = `${chatTimeLabel(chat.updated)}${shots ? ` · ${shots} 张图` : ""}`;
+      return `<div class="chat-item${chat === agent ? " active" : ""}" data-id="${chat.id}" role="button" tabindex="0"><div class="chat-item-text"><div class="chat-item-title">${escapeHtml(chatTitle(chat))}</div><div class="chat-item-sub">${sub}</div></div><button type="button" class="chat-item-del" data-act="delete" title="删除这段对话">${icon("trash", 14)}</button></div>`;
+    })
+    .join("");
+}
+
+// 换到另一段对话（或新开一段）。正在思考或出图时不让换，免得结果写到别的对话里
+function switchChat(next) {
+  if (agentBusy || agentRun) {
+    toast("等这一轮完成再切换对话");
+    return false;
+  }
+  if (agent.usedRef) setRef(null); // 助手放进表单的参考图属于原来那段对话，不带过去
+  agent = next;
+  agentAttach = null;
+  renderAgentAttach();
+  renderAgent();
+  saveAgent();
+  if (window.innerWidth <= 900) setRailOpen(false, { remember: false });
+  return true;
+}
+
+function setRailOpen(open, { remember = true } = {}) {
+  promptHelper.classList.toggle("rail-open", open);
+  railToggleBtn.setAttribute("aria-pressed", String(open));
+  if (remember && window.innerWidth > 900) store.set(RAIL_KEY, open);
+}
+railToggleBtn.addEventListener("click", () => setRailOpen(!promptHelper.classList.contains("rail-open")));
+
+chatList.addEventListener("click", async (event) => {
+  const item = event.target.closest(".chat-item");
+  if (!item) return;
+  const chat = chats.find((c) => c.id === item.dataset.id);
+  if (!chat) return;
+  if (event.target.closest('[data-act="delete"]')) {
+    if (agentBusy || agentRun) {
+      toast("等这一轮完成再删除对话");
+      return;
+    }
+    const ok = await confirmDialog({ title: "删除这段对话？", message: `「${chatTitle(chat).slice(0, 40)}」的聊天记录会被删除。已经出的图还在历史画廊里。`, okText: "删除" });
+    if (!ok) return;
+    chats = chats.filter((c) => c !== chat);
+    if (chat === agent) switchChat(newChat());
+    else saveAgent();
+    return;
+  }
+  if (chat !== agent) switchChat(chat);
+});
+chatList.addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && event.target.classList.contains("chat-item")) event.target.click();
+});
 
 function agentPlanTags(turn) {
   return [
-    turn.aspect,
+    turn.use_reference ? null : turn.aspect,
     `${turn.count} 张`,
     `${turn.steps} 步`,
     turn.guidance_scale > 0 ? `CFG ${turn.guidance_scale}` : null,
     turn.seed == null ? "Seed 随机" : `Seed ${turn.seed}`,
+    turn.use_reference ? `图生图 · 重绘幅度 ${turn.strength}` : null,
   ].filter(Boolean);
 }
 
-function renderAgent() {
-  if (!agent.messages.length && !agentBusy) {
-    agentThread.innerHTML = `<p class="agent-empty">说说想要什么画面，助手会写好提示词，自己定比例、张数和 Seed 然后出图。不满意就接着说怎么改，它记得前面的每一版。</p>`;
-    return;
+function agentMessageHtml(m, index) {
+  if (m.role === "user") {
+    const usage = m.imageMode === "describe" ? "只提取提示词" : "图生图";
+    const image = m.image ? `<div class="bubble-ref"><img class="bubble-img" src="${escapeHtml(m.image)}" alt="参考图" loading="lazy" /><span class="tag">参考图 · ${usage}</span></div>` : "";
+    return `<div class="msg user"><div class="user-col">${image}<div class="bubble">${escapeHtml(m.content)}</div></div></div>`;
   }
-  const html = agent.messages.map((m) => {
-    if (m.role === "user") return `<div class="agent-msg user">${escapeHtml(m.content)}</div>`;
-    const turn = m.turn;
-    const plan = turn.generate ? `<div class="agent-plan">${agentPlanTags(turn).map((t) => `<span class="tag">${escapeHtml(t)}</span>`).join("")}</div>` : "";
-    const result = m.result ? `<div class="agent-result">${escapeHtml(m.result)}</div>` : "";
-    return `<div class="agent-msg bot">${escapeHtml(turn.reply)}${plan}${result}</div>`;
-  });
-  if (agentBusy) html.push(`<div class="agent-msg bot typing"><span class="spinner"></span>思考中…</div>`);
-  agentThread.innerHTML = html.join("");
-  agentThread.scrollTop = agentThread.scrollHeight;
+  const turn = m.turn;
+  const parts = [`<div class="msg-text">${escapeHtml(turn.reply)}</div>`];
+  if (turn.generate) {
+    const tags = agentPlanTags(turn).map((t) => `<span class="tag">${escapeHtml(t)}</span>`).join("");
+    const variants = turn.variants?.length
+      ? `<ol class="plan-variants">${turn.variants.map((v) => `<li>${escapeHtml(v)}</li>`).join("")}</ol>`
+      : "";
+    parts.push(
+      `<div class="plan"><button type="button" class="plan-prompt${m.open ? " open" : ""}" data-act="prompt" data-i="${index}" title="点击展开 / 收起提示词">${escapeHtml(turn.prompt)}</button>${variants}<div class="plan-tags">${tags}</div></div>`,
+    );
+  }
+  const run = agentRun?.msg === m ? agentRun : null;
+  const shots = (m.images || []).map(
+    (img) =>
+      `<button type="button" class="shot" data-act="open" data-name="${escapeHtml(img.url.split("/").pop())}" style="aspect-ratio:${img.w}/${img.h}" title="Seed ${img.seed} · 点击看大图"><img src="${escapeHtml(img.url)}" alt="" loading="lazy" /></button>`,
+  );
+  if (run) {
+    // 还没出来的几张先占位：第一个显示进度，其余排队
+    for (let i = run.done; i < run.count; i += 1) {
+      const body = i === run.done ? `<span class="spinner"></span><span id="agentProgress">${escapeHtml(agentProgressText)}</span>` : "<span>排队中</span>";
+      shots.push(`<div class="shot pending${i === run.done ? "" : " wait"}" style="aspect-ratio:${run.w}/${run.h}">${body}</div>`);
+    }
+  }
+  if (shots.length) {
+    // 同一轮的图排成一行（横图 4 张以上排两列），并限制单张的高度，免得竖图撑得太高
+    const first = m.images?.[0] || run;
+    const ratio = first.w / first.h;
+    const cols = shots.length <= 3 ? shots.length : ratio > 1 ? 2 : 4;
+    const maxHeight = shots.length === 1 ? 420 : 320;
+    const maxWidth = Math.round(cols * maxHeight * ratio + (cols - 1) * 8);
+    parts.push(`<div class="shots" style="grid-template-columns:repeat(${cols},minmax(0,1fr));max-width:${maxWidth}px">${shots.join("")}</div>`);
+  }
+  if (m.error) parts.push(`<div class="msg-error">${icon("alert", 15)}<span>${escapeHtml(m.error)}</span></div>`);
+  if (m.result && !run) parts.push(`<div class="msg-note">${escapeHtml(m.result)}</div>`);
+  return `<div class="msg bot"><div class="avatar">${icon("sparkles", 15)}</div><div class="msg-body">${parts.join("")}</div></div>`;
 }
 
-// 把助手定的提示词和参数填进左边的表单
-function applyAgentPlan(turn) {
+function renderAgent({ stick = true } = {}) {
+  if (!agent.messages.length && !agentBusy) {
+    const suggests = AGENT_SUGGESTS.map((s) => `<button type="button" class="chip" data-act="suggest">${escapeHtml(s)}</button>`).join("");
+    agentThread.innerHTML = `<div class="chat-empty"><div class="avatar lg">${icon("sparkles", 22)}</div><h3>想画点什么？</h3><p>用中文说出画面，助手会写好提示词，自己定比例、张数和 Seed 然后出图。<br />不满意就接着说怎么改，它记得前面的每一版。</p><div class="suggests">${suggests}</div></div>`;
+    return;
+  }
+  const html = agent.messages.map(agentMessageHtml);
+  if (agentBusy) {
+    const text = llmSettings?.state === "ready" ? "思考中…" : "正在加载本地模型并思考…";
+    html.push(`<div class="msg bot"><div class="avatar">${icon("sparkles", 15)}</div><div class="msg-body"><div class="typing"><span class="spinner"></span>${text}</div></div></div>`);
+  }
+  agentThread.innerHTML = html.join("");
+  if (stick) agentThread.scrollTop = agentThread.scrollHeight;
+}
+
+// 对话里的图如果已经在画廊里删掉了，显示成「图片已删除」而不是裂图
+agentThread.addEventListener("error", (event) => event.target.closest?.(".shot")?.classList.add("gone"), true);
+
+agentThread.addEventListener("click", (event) => {
+  const target = event.target.closest("[data-act]");
+  if (!target) return;
+  if (target.dataset.act === "suggest") {
+    agentInput.value = target.textContent;
+    growAgentInput();
+    agentInput.focus();
+  } else if (target.dataset.act === "prompt") {
+    const m = agent.messages[Number(target.dataset.i)];
+    if (!m) return;
+    m.open = !m.open;
+    target.classList.toggle("open", m.open);
+  } else if (target.dataset.act === "open") {
+    const index = images.findIndex((item) => item.name === target.dataset.name);
+    if (index >= 0) openLightbox(index);
+    else toast("这张图已经被删除了");
+  }
+});
+
+// 把助手定的提示词和参数填进参数表单
+async function applyAgentPlan(turn) {
+  const ref = agentRefImage();
+  if (ref) {
+    // 对话里有参考图时，用不用它由助手这一轮决定：重绘就放进表单，只是看图写提示词就撤掉
+    // 图生图时画面比例跟着参考图走（fit），免得原图被裁掉一大块
+    await setRef(turn.use_reference ? ref : null, { fit: true });
+    if (turn.use_reference) setPair(strengthInput, strengthRange, turn.strength);
+    agent.usedRef = true;
+  }
+  const img2img = !!(ref && turn.use_reference && refImage);
   promptInput.value = turn.prompt;
   negativeInput.value = turn.negative_prompt || "";
-  if (SIZES[familyOf(currentModel())][turn.aspect]) applyRatio(turn.aspect);
+  if (!img2img && SIZES[familyOf(currentModel())][turn.aspect]) applyRatio(turn.aspect);
   setPair(stepsInput, stepsRange, turn.steps);
   setPair(guidanceInput, guidanceRange, turn.guidance_scale);
   seedInput.value = turn.seed == null ? "" : turn.seed;
@@ -843,31 +1107,89 @@ function applyAgentPlan(turn) {
   saveForm();
 }
 
-// 出完图后记下结果：显示在助手那条消息下面，并在用户下次说话时告诉助手
-function agentNoteGeneration(seeds, prompt, strength) {
-  const last = agent.messages[agent.messages.length - 1];
-  if (!seeds.length || promptMode() !== "agent" || last?.role !== "assistant") return;
-  // 左边放了参考图时出的是图生图，画面会被参考图带着走，要让用户和助手都知道
-  const ref = strength ? `（图生图：按参考图重绘，幅度 ${strength}）` : "";
-  const text = `已出图 ${seeds.length} 张，seed：${seeds.join("、")}${ref}`;
-  last.result = text;
-  agent.pending = `上一轮${text}`;
-  if (prompt !== last.turn.prompt) agent.pending += `。出图前用户把提示词手动改成了：${prompt}`;
+/* 出图过程挂在对话里：开始时占位，出一张显示一张，结束后记下结果 */
+function agentGenStart(count, base) {
+  if (promptMode() !== "agent") return;
+  let msg = agent.messages[agent.messages.length - 1];
+  if (msg?.role !== "assistant" || !msg.turn.generate) {
+    // 用户没经过助手、直接按表单参数出图：在对话里补一条记录，图才有地方放
+    msg = {
+      role: "assistant",
+      local: true,
+      turn: {
+        reply: "按参数面板里的设置出图。",
+        generate: true,
+        prompt: base.prompt,
+        aspect: activeRatio() || `${base.width} × ${base.height}`,
+        count,
+        steps: base.steps,
+        guidance_scale: base.guidance_scale,
+        seed: base.seed,
+      },
+    };
+    agent.messages.push(msg);
+  }
+  msg.error = "";
+  agentRun = { msg, count, done: 0, w: base.width, h: base.height };
+  renderAgent();
+}
+
+function agentGenImage(url, seed, w, h) {
+  if (!agentRun) return;
+  agentRun.msg.images = [...(agentRun.msg.images || []), { url, seed, w, h }];
+  agentRun.done += 1;
   renderAgent();
   saveAgent();
 }
 
+function agentSetProgress(text) {
+  agentProgressText = text;
+  const el = $("#agentProgress");
+  if (el) el.textContent = text;
+}
+
+function agentGenEnd(seeds, prompt, strength, error) {
+  if (!agentRun) return;
+  const msg = agentRun.msg;
+  agentRun = null;
+  agent.updated = Date.now();
+  if (error) msg.error = seeds.length ? `第 ${seeds.length + 1} 张生成失败：${error}` : error;
+  if (seeds.length) {
+    // 放了参考图时出的是图生图，画面会被参考图带着走，要让用户和助手都知道
+    const ref = strength ? `（图生图：按参考图重绘，幅度 ${strength}）` : "";
+    const text = `已出图 ${seeds.length} 张，seed：${seeds.join("、")}${ref}`;
+    msg.result = text;
+    if (msg.local) agent.pending = `用户按参数面板手动${text}，提示词是：${prompt}`;
+    else {
+      agent.pending = `上一轮${text}`;
+      if (prompt !== msg.turn.prompt) agent.pending += `。出图前用户把提示词手动改成了：${prompt}`;
+    }
+  }
+  renderAgent();
+  saveAgent();
+}
+
+function growAgentInput() {
+  agentInput.style.height = "auto";
+  agentInput.style.height = `${Math.min(agentInput.scrollHeight, 180)}px`;
+}
+
 async function sendAgent() {
-  const text = agentInput.value.trim();
+  const attach = agentAttach;
+  const text = agentInput.value.trim() || (attach ? "看看这张参考图。" : "");
   if (!text || agentBusy) return;
   if (isBusy) {
     toast("正在出图，等这批出完再说");
     return;
   }
   const pending = agent.pending;
-  agent.messages.push({ role: "user", content: text, sent: pending ? `[系统记录：${pending}]\n${text}` : text });
+  agent.updated = Date.now();
+  agent.messages.push({ role: "user", content: text, sent: pending ? `[系统记录：${pending}]\n${text}` : text, image: attach || undefined, imageMode: attach ? attachMode() : undefined });
+  agentAttach = null;
+  renderAgentAttach();
   agent.pending = "";
   agentInput.value = "";
+  growAgentInput();
   agentBusy = true;
   llmBusy = true;
   agentSendBtn.disabled = true;
@@ -880,7 +1202,10 @@ async function sendAgent() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        messages: agent.messages.map((m) => (m.role === "user" ? { role: "user", content: m.sent } : { role: "assistant", turn: m.turn })),
+        // 手动出图的记录（local）只给人看，不进模型的对话历史
+        messages: agent.messages
+          .filter((m) => !m.local)
+          .map((m) => (m.role === "user" ? { role: "user", content: m.sent, image: m.image || "", image_mode: m.image ? m.imageMode || "" : "" } : { role: "assistant", turn: m.turn })),
         target_model: currentModel(),
       }),
     });
@@ -895,7 +1220,10 @@ async function sendAgent() {
     // 没发成功：把这句话退回输入框，对话保持原样
     agent.messages.pop();
     agent.pending = pending;
-    agentInput.value = text;
+    agentInput.value = attach && text === "看看这张参考图。" ? "" : text;
+    agentAttach = attach;
+    renderAgentAttach();
+    growAgentInput();
     toast(error.message || "助手没有回应", "error", 4000);
   } finally {
     agentBusy = false;
@@ -906,12 +1234,16 @@ async function sendAgent() {
     refreshSettings().catch(() => {});
   }
   if (!turn?.generate) return;
-  applyAgentPlan(turn);
-  if (agentAuto.checked) await runGeneration();
-  else toast("提示词和参数已填好，点「生成图片」", "success", 3500);
+  await applyAgentPlan(turn);
+  if (agentAuto.checked) await runGeneration(turn.variants || []);
+  else {
+    setParamsOpen(true);
+    toast("提示词和参数已填好，点「生成图片」", "success", 3500);
+  }
 }
 
 agentSendBtn.addEventListener("click", sendAgent);
+agentInput.addEventListener("input", growAgentInput);
 agentInput.addEventListener("keydown", (event) => {
   // Enter 发送，Shift + Enter 换行；输入法选字时的回车不算
   if (event.key !== "Enter" || event.shiftKey || event.ctrlKey || event.metaKey || event.isComposing) return;
@@ -919,13 +1251,111 @@ agentInput.addEventListener("keydown", (event) => {
   sendAgent();
 });
 agentNewBtn.addEventListener("click", () => {
-  if (agentBusy) return;
-  agent = { messages: [], pending: "" };
-  renderAgent();
-  saveAgent();
+  // 旧对话留在左侧的对话记录里；当前已经是空白的新对话就不用再开
+  if (agent.messages.length && !switchChat(newChat())) return;
   agentInput.focus();
 });
 agentAuto.addEventListener("change", saveAgent);
+
+/* ---------------- AI 助手的参考图：附在输入框里，随下一句话发给助手 ---------------- */
+// 助手能看见这张图：可以照着它写提示词，也可以决定出图时按它重绘（图生图）
+let agentAttach = null; // 待发送的参考图地址（已经存到服务器的 /outputs/refs/…）
+const ATTACH_MODE_KEY = "aigen.attach.mode";
+const ATTACH_MODE_NOTES = {
+  ref: "把这张图当底图重绘，构图和内容会跟着原图走。说说想改什么，不说就照原图重画。",
+  describe: "助手只看图写提示词，出图时不用这张图，画面是全新生成的。",
+};
+
+// 参考图用法：ref 图生图（默认） / describe 只提取提示词
+function attachMode() {
+  return $("button.active", attachModeSeg)?.dataset.mode || "ref";
+}
+function setAttachMode(mode) {
+  for (const btn of $$("button", attachModeSeg)) btn.classList.toggle("active", btn.dataset.mode === mode);
+  attachModeNote.textContent = ATTACH_MODE_NOTES[mode];
+}
+attachModeSeg.addEventListener("click", (event) => {
+  const btn = event.target.closest("button[data-mode]");
+  if (!btn) return;
+  setAttachMode(btn.dataset.mode);
+  store.set(ATTACH_MODE_KEY, btn.dataset.mode);
+});
+setAttachMode(store.get(ATTACH_MODE_KEY, "ref") === "describe" ? "describe" : "ref");
+
+function renderAgentAttach() {
+  composerAttach.hidden = !agentAttach;
+  composerAttachBtn.classList.toggle("chip-on", !!agentAttach);
+  if (agentAttach) composerAttachImg.src = agentAttach;
+}
+
+// src：浏览器里读出来的 data URL，或 /outputs/ 下已有图片的地址
+async function agentAttachSrc(src) {
+  try {
+    const response = await fetch("/api/refs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ image: src }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.detail || "参考图上传失败");
+    agentAttach = data.url;
+    renderAgentAttach();
+    agentInput.focus();
+  } catch (error) {
+    toast(error.message || "参考图上传失败", "error", 3500);
+  }
+}
+
+async function agentAttachFile(file) {
+  if (!file || !file.type.startsWith("image/")) {
+    toast("请选择图片文件", "error");
+    return;
+  }
+  const url = URL.createObjectURL(file);
+  try {
+    // 上传前把长边压到 2048 以内
+    const img = await loadImage(url);
+    const scale = Math.min(1, 2048 / Math.max(img.naturalWidth, img.naturalHeight));
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(img.naturalWidth * scale));
+    canvas.height = Math.max(1, Math.round(img.naturalHeight * scale));
+    canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
+    await agentAttachSrc(canvas.toDataURL("image/png"));
+  } catch {
+    toast("这张图片浏览器读不了，换一张试试", "error");
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+composerAttachBtn.addEventListener("click", () => agentFile.click());
+agentFile.addEventListener("change", () => {
+  agentAttachFile(agentFile.files[0]);
+  agentFile.value = "";
+});
+composerAttachClear.addEventListener("click", () => {
+  agentAttach = null;
+  renderAgentAttach();
+});
+promptHelper.addEventListener("dragover", (event) => {
+  if (!Array.from(event.dataTransfer?.types || []).includes("Files")) return;
+  event.preventDefault();
+  promptHelper.classList.add("is-over");
+});
+promptHelper.addEventListener("dragleave", (event) => {
+  if (!promptHelper.contains(event.relatedTarget)) promptHelper.classList.remove("is-over");
+});
+promptHelper.addEventListener("drop", (event) => {
+  event.preventDefault();
+  promptHelper.classList.remove("is-over");
+  agentAttachFile(event.dataTransfer.files[0]);
+});
+
+// 对话里最近一次附的参考图：之后的轮次里助手说「按参考图重绘」指的就是它
+function agentRefImage() {
+  for (let i = agent.messages.length - 1; i >= 0; i -= 1) if (agent.messages[i].image) return agent.messages[i].image;
+  return null;
+}
 
 /* ---------------- 本地 LLM 状态 ---------------- */
 let llmSettings = null;
@@ -982,6 +1412,7 @@ function setBusy(busy) {
         busyText.textContent = `${nth}${needsLoad ? "加载模型中" : "准备中"} · ${s}s`;
       }
       setEngine("busy", `生成中 · ${s}s`);
+      agentSetProgress(busyText.textContent);
     };
     $(".busy-sub", stage).hidden = engine.loadedModel === model;
     tick();
@@ -1060,7 +1491,8 @@ form.addEventListener("submit", (event) => {
 });
 
 // 按表单当前的参数出图（点「生成图片」和 AI 助手自动出图都走这里）
-async function runGeneration() {
+// variants：助手给每张图各写的一句补充（机位、构图、光线…），接在提示词后面，让同一批的几张有区别
+async function runGeneration(variants = []) {
   if (isBusy) return;
   const base = formPayload();
   if (!base.prompt) {
@@ -1076,15 +1508,17 @@ async function runGeneration() {
   const usedRef = refImage;
   base.init_image = usedRef ? usedRef.src : "";
   const count = readCount();
-  // 同一次生成的几张共用一个批次号，历史里折叠成一组
-  base.batch = count > 1 ? `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}` : "";
+  // 助手模式下，同一段对话出的图都归到这段对话的图片夹里
+  base.batch = promptMode() === "agent" ? chatBatch(agent) : count > 1 ? `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}` : "";
   saveForm();
   stopRequested = false;
   batch = { index: 1, count };
+  agentGenStart(count, base);
   setBusy(true);
   let done = 0;
   let totalSeconds = 0;
   const seeds = [];
+  let failure = "";
   try {
     // 多张是一张一张地生成：显存占用不变，每张有自己的 Seed，出一张显示一张
     for (let i = 0; i < count && !stopRequested; i += 1) {
@@ -1092,6 +1526,7 @@ async function runGeneration() {
       lastProgress = null;
       busyTimerTick?.();
       const payload = { ...base, seed: base.seed == null ? null : (base.seed + i) % 2 ** 32 };
+      if (variants[i]) payload.prompt = `${base.prompt}\n${variants[i]}`;
       const data = await requestGenerate(payload);
       done += 1;
       seeds.push(data.seed);
@@ -1108,6 +1543,7 @@ async function runGeneration() {
       showPreview(data.url, { ...payload, init_image: data.init_image, seed: data.seed, seconds: data.seconds });
       images = data.images || [];
       renderGallery();
+      agentGenImage(data.url, data.seed, payload.width, payload.height);
       updateLastRun(data.gpu_metrics);
       const saved = `已保存到 outputs/${data.url.split("/").pop()}`;
       runInfo.textContent = count > 1 ? `第 ${done} / ${count} 张 · ${saved}` : saved;
@@ -1115,6 +1551,7 @@ async function runGeneration() {
     if (count > 1) toast(`${done < count ? "已停止 · " : ""}生成了 ${done} 张 · 共 ${totalSeconds.toFixed(1)}s`, "success", 3500);
     else toast(`生成完成 · ${totalSeconds.toFixed(1)}s`, "success");
   } catch (error) {
+    failure = error.message || "生成失败";
     if (done) {
       // 前面几张已经保存，保留最后一张的预览，只提示出错的这张
       runInfo.textContent = `第 ${done + 1} 张生成失败：${error.message}`;
@@ -1131,7 +1568,7 @@ async function runGeneration() {
   } finally {
     batch = null;
     setBusy(false);
-    agentNoteGeneration(seeds, base.prompt, usedRef ? base.strength : null);
+    agentGenEnd(seeds, base.prompt, usedRef ? base.strength : null, failure);
   }
 }
 
@@ -1141,14 +1578,23 @@ stopBatchBtn.addEventListener("click", () => {
   stopBatchBtn.textContent = "这张完成后就停";
 });
 
+// 把一张已有的图当参考图：助手模式下放进输入框（下一句话带给助手），否则放进参数表单
+function useAsRef(url) {
+  if (promptMode() === "agent") {
+    agentAttachSrc(url).then(() => agentAttach && toast("已放进输入框，说说想怎么用这张图", "success", 3200));
+    return;
+  }
+  setRef(url);
+  toast("已把这张图设为参考图");
+}
+
 useRefBtn.addEventListener("click", () => {
   if (!currentResult) return;
-  setRef(currentResult.url);
-  toast("已把这张图设为参考图");
+  useAsRef(currentResult.url);
 });
 
 document.addEventListener("keydown", (event) => {
-  if ((event.ctrlKey || event.metaKey) && event.key === "Enter" && !$(".modal-overlay")) {
+  if ((event.ctrlKey || event.metaKey) && event.key === "Enter" && !$(".modal-overlay") && promptMode() !== "gallery") {
     event.preventDefault();
     form.requestSubmit();
   }
@@ -1193,7 +1639,7 @@ function thumbHtml({ item, index }) {
       </article>`;
 }
 
-// 同一次生成的几张叠成一摞（最上面是最新的那张，后面露出另外两张），点击像打开文件夹一样弹出
+// 同一次生成的几张叠成一摞（最上面是第 1 张，后面露出第 2、3 张），点击像打开文件夹一样弹出
 function stackHtml(group) {
   const n = group.items.length;
   const key = escapeHtml(group.key);
@@ -1204,7 +1650,7 @@ function stackHtml(group) {
         <div class="stack-wrap">
           ${layer(group.items[2], "l2")}
           ${layer(group.items[1], "l1")}
-          <div class="thumb-media" role="button" tabindex="0" data-group="${key}" title="同一次生成的 ${n} 张，点击打开">
+          <div class="thumb-media" role="button" tabindex="0" data-group="${key}" title="${isChatGroup(group.key) ? "同一段对话" : "同一次生成"}的 ${n} 张，点击打开">
             <img src="${escapeHtml(item.url)}" alt="${escapeHtml(item.prompt || item.name)}" loading="lazy" />
             <span class="stack-badge">${n} 张</span>
             <div class="thumb-actions">
@@ -1297,8 +1743,9 @@ function openFolder(key) {
       close();
       return;
     }
-    $(".folder-title", modal).textContent = `同一次生成 · ${items.length} 张`;
-    $(".folder-prompt", modal).textContent = items[0].item.prompt || "无提示词";
+    const chat = isChatGroup(key) ? chats.find((c) => chatBatch(c) === key) : null;
+    $(".folder-title", modal).textContent = `${isChatGroup(key) ? "同一段对话" : "同一次生成"} · ${items.length} 张`;
+    $(".folder-prompt", modal).textContent = chat ? `对话：${chatTitle(chat)}` : items[0].item.prompt || "无提示词";
     $(".group-grid", modal).innerHTML = items.map(thumbHtml).join("");
   };
   const closeModal = openModal(modal);
@@ -1326,7 +1773,7 @@ async function deleteGroup(key) {
   if (!names.length) return;
   const ok = await confirmDialog({
     title: `删除这 ${names.length} 张图片？`,
-    message: "同一次生成的这几张图片和它们的参数记录会从 outputs 目录删除，无法恢复。",
+    message: `${isChatGroup(key) ? "这段对话里出的" : "同一次生成的"}这几张图片和它们的参数记录会从 outputs 目录删除，无法恢复。`,
   });
   if (!ok) return;
   let removed = 0;
@@ -1361,6 +1808,10 @@ async function reuseParams(name) {
   try {
     const meta = await loadMeta(name);
     applyParams(meta);
+    // 参数填进了表单：在画廊里就跳到手动出图，在助手里就把参数面板打开，让人看得到
+    if (promptMode() === "gallery") setPromptMode("en");
+    else if (promptMode() === "agent") setParamsOpen(true);
+    saveForm();
     toast(`已载入参数 · Seed ${meta.seed}`, "success");
     return true;
   } catch (error) {
@@ -1556,8 +2007,7 @@ function openLightbox(startIndex) {
     if (act === "next") move(1);
     if (act === "reuse" && (await reuseParams(images[index].name))) close();
     if (act === "ref") {
-      setRef(images[index].url);
-      toast("已把这张图设为参考图");
+      useAsRef(images[index].url);
       close();
     }
     if (act === "delete") {

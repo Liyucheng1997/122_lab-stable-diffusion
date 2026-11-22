@@ -12,7 +12,7 @@
       } catch (e) {}
     </script>
     <link rel="stylesheet" href="/static/tokens.css?v=13" />
-    <link rel="stylesheet" href="/static/styles.css?v=17" />
+    <link rel="stylesheet" href="/static/styles.css?v=25" />
   </head>
   <body>
     <div id="app">
@@ -21,6 +21,12 @@
         <div class="brand">
           <div class="brand-name">本地 AI 生图</div>
           <div id="statusText" class="brand-sub">正在检测环境…</div>
+        </div>
+        <div class="spacer"></div>
+        <div class="seg mode-seg" id="promptModeSeg" role="tablist" aria-label="出图方式">
+          <button type="button" data-mode="agent" class="active">AI 助手</button>
+          <button type="button" data-mode="en">手动出图</button>
+          <button type="button" data-mode="gallery">历史画廊</button>
         </div>
         <div class="spacer"></div>
         <div class="status-pill" title="后端状态">
@@ -32,30 +38,62 @@
       </header>
 
       <div class="workspace">
-        <!-- 左侧：参数 -->
+        <!-- AI 助手：对话为主，图片直接出在对话里 -->
+        <section id="promptHelper" class="chat" aria-label="AI 助手对话" hidden>
+          <!-- 对话记录：每段对话都留着，随时可以回来接着改 -->
+          <aside class="chat-rail" aria-label="对话记录">
+            <button id="agentNewBtn" class="btn rail-new" type="button"><span data-icon="plus" data-size="15"></span>新对话</button>
+            <div class="rail-title">对话记录</div>
+            <div id="chatList" class="chat-list"></div>
+          </aside>
+          <div class="chat-main">
+          <div class="chat-header">
+            <button id="railToggleBtn" class="icon-btn icon-btn-fill" type="button" title="显示 / 收起对话记录" aria-pressed="true" data-icon="sidebar" data-size="17"></button>
+            <div class="card-heading">
+              <h2 class="card-title">AI 助手</h2>
+              <p id="promptHelperStatus" class="card-sub">本地模型</p>
+            </div>
+            <div class="card-actions">
+              <button id="paramsToggleBtn" class="btn btn-sm" type="button" aria-pressed="false">参数</button>
+            </div>
+          </div>
+          <div id="agentThread" class="chat-thread" aria-live="polite"></div>
+          <div class="composer-wrap">
+            <div class="composer">
+              <div id="composerAttach" class="composer-attach" hidden>
+                <img id="composerAttachImg" alt="参考图" />
+                <div class="composer-attach-info">
+                  <div class="seg" id="attachModeSeg" role="tablist" aria-label="参考图用法">
+                    <button type="button" data-mode="ref" class="active">图生图</button>
+                    <button type="button" data-mode="describe">只提取提示词</button>
+                  </div>
+                  <span id="attachModeNote" class="field-note"></span>
+                </div>
+                <button id="composerAttachClear" class="modal-x" type="button" title="移除参考图" data-icon="x" data-size="13"></button>
+              </div>
+              <textarea id="agentInput" rows="1" placeholder="描述想要的画面，或者说怎么改…（可以粘贴或拖入参考图）"></textarea>
+              <div class="composer-bar">
+                <input id="agentFile" type="file" accept="image/*" hidden />
+                <button id="composerAttachBtn" class="chip" type="button" title="添加参考图：让助手看图写提示词，或按这张图重绘。也可以直接粘贴、拖进来"><span data-icon="image" data-size="14"></span>参考图</button>
+                <button id="composerModel" class="chip" type="button" title="换模型、LoRA 和其他参数">Z-Image Turbo</button>
+                <button id="composerRef" class="chip chip-on" type="button" title="参数面板里放着参考图，出图时会按它重绘（图生图）。点这里查看或移除" hidden>图生图中</button>
+                <label class="chip chip-check" title="关掉后，助手只把提示词和参数填进表单，由你点「生成图片」"><input id="agentAuto" type="checkbox" checked /> 自动出图</label>
+                <span class="spacer"></span>
+                <span class="composer-hint">Enter 发送 · Shift + Enter 换行</span>
+                <button id="agentSendBtn" class="send-btn" type="button" title="发送" data-icon="up" data-size="18"></button>
+              </div>
+            </div>
+          </div>
+          </div>
+        </section>
+
+        <!-- 参数：手动出图时在左侧，AI 助手模式下收在右侧 -->
         <aside class="sidebar" aria-label="生成参数">
           <form id="generateForm" class="sidebar-form">
             <div class="sidebar-scroll">
               <section class="section">
                 <div class="section-head">
                   <h2 class="section-title">提示词</h2>
-                  <div class="seg" id="promptModeSeg" role="tablist">
-                    <button type="button" data-mode="en" class="active">直接输入</button>
-                    <button type="button" data-mode="agent">AI 助手</button>
-                  </div>
-                </div>
-
-                <div id="promptHelper" class="helper agent" hidden>
-                  <div class="agent-head">
-                    <span id="promptHelperStatus" class="field-hint">本地模型</span>
-                    <button id="agentNewBtn" class="link-btn" type="button">新对话</button>
-                  </div>
-                  <div id="agentThread" class="agent-thread" aria-live="polite"></div>
-                  <div class="agent-input">
-                    <textarea id="agentInput" class="input" rows="2" placeholder="描述想要的画面，或者说怎么改…"></textarea>
-                    <button id="agentSendBtn" class="btn btn-primary" type="button">发送</button>
-                  </div>
-                  <label class="agent-auto"><input id="agentAuto" type="checkbox" checked /> 助手定好参数后自动出图</label>
                 </div>
 
                 <div class="stack">
@@ -289,19 +327,21 @@
             </div>
           </section>
 
-          <section class="card" aria-label="历史图片">
-            <div class="card-header">
-              <div class="card-heading">
-                <h2 class="card-title">历史图片</h2>
-                <p id="galleryCount" class="card-sub">--</p>
-              </div>
-            </div>
-            <div id="gallery" class="gallery"></div>
-          </section>
         </main>
+
+        <!-- 历史画廊：所有出过的图，独立一页 -->
+        <section id="galleryView" class="card gallery-view" aria-label="历史画廊">
+          <div class="card-header">
+            <div class="card-heading">
+              <h2 class="card-title">历史画廊</h2>
+              <p id="galleryCount" class="card-sub">--</p>
+            </div>
+          </div>
+          <div id="gallery" class="gallery"></div>
+        </section>
       </div>
     </div>
     <div id="toastHost" class="toast-host"></div>
-    <script src="/static/app.js?v=18"></script>
+    <script src="/static/app.js?v=27"></script>
   </body>
 </html>
