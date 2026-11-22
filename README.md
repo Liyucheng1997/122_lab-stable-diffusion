@@ -44,14 +44,20 @@ py -3.11 -m venv .venv
 http://127.0.0.1:7860
 ```
 
-## Claude 提示词优化
+## 本地 LLM 提示词优化
 
-网页「提示词 → 中文优化」可以输入中文描述，由 **Claude Opus 5.5** 改写成适合当前模型的提示词：
+网页「提示词 → 中文优化」可以输入中文描述，由**本地的 Gemma 4**（llama.cpp，不联网、不需要 API Key）改写成适合当前模型的提示词：
 
 - Z-Image Turbo：一段自然语言英文描述，不写反向提示词（它在 CFG 0 下不读）
 - SDXL / SD 1.5：逗号分隔的英文短语 + 反向提示词
 
-第一次使用时点「设置 API Key」，粘贴在 [Anthropic Console](https://console.anthropic.com/settings/keys) 创建的 Key，网页会先校验再保存到项目的 `.env`（`ANTHROPIC_API_KEY`）。Key 只在后端读取，不会发回浏览器，`.env` 也不会提交到 GitHub。
+模型和 llama.cpp 用的是隔壁 `459_无审查LLM` 项目里的文件（放在别处时在 `.env` 里设 `LOCAL_LLM_DIR`，其他可调项见 `.env.example`）。网页服务启动时会顺带在后台启动 `llama-server`（端口 8090），日志在 `logs/llama-server.log`。
+
+**显存调度**：16GB 显存放不下 Gemma（约 8GB）和生图模型同时计算，所以两边轮流用显卡——
+
+- 点「生成图片」：先结束 `llama-server`，显存整块还给生图模型；
+- 点「转写」：先让生图模型把显存让出来（权重留在内存里，不用重新加载），再启动 Gemma，通常几秒；
+- 连续出图或连续转写时不会发生切换，只有在两者之间来回时才切一次。
 
 ## 模型
 

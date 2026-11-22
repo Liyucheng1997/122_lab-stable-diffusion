@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
+import io
 import json
 import os
+import random
 import subprocess
 import time
 from datetime import datetime
@@ -16,7 +21,9 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from app import catalog, prompt_ai
+from app import catalog, local_llm, prompt_ai
+from app.local_llm import llm
+from app.worker_client import GenerationWorker, WorkerCrashed, crash_detail, raise_for_error
 
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -36,6 +43,8 @@ LORA_DISPLAY_NAMES = {
     "style_pencil_sketch_sd15.safetensors": "铅笔素描风格",
     "style_realistic_photo_sd15.safetensors": "写实摄影增强",
 }
+
+REF_DIR = OUTPUT_DIR / "refs"  # 图生图用过的参考图
 
 OUTPUT_DIR.mkdir(exist_ok=True)
 LORA_DIR.mkdir(exist_ok=True)
@@ -67,10 +76,11 @@ class GenerateRequest(BaseModel):
     steps: int = Field(default=9, ge=1, le=100)
     guidance_scale: float = Field(default=0.0, ge=0.0, le=30.0)
     seed: int | None = Field(default=None, ge=0, le=2**32 - 1)
-
-
-class ClaudeKeyRequest(BaseModel):
-    api_key: str = Field(min_length=1, max_length=400)
+    # 图生图：init_image 是 data URL（新上传的图）或 /outputs/ 下的图片地址；留空就是文生图
+    init_image: str = Field(default="", max_length=40_000_000)
+    strength: float = Field(default=0.6, ge=0.05, le=1.0)
+    # 一次生成多张时，前端给这几张同一个批次号，历史里据此折叠成一组
+    batch: str = Field(default="", max_length=40, pattern=r"^[A-Za-z0-9_-]*$")
 
 
 class DownloadRequest(BaseModel):
@@ -83,34 +93,37 @@ class PromptOptimizeRequest(BaseModel):
     target_model: str = Field(default="", max_length=300)  # 模型 ID，用来判断提示词格式
 
 
-class LoadedPipeline:
-    pipe: Any | None = None
-    model_key: str | None = None
-    lora_key: str | None = None
-    lora_scale: float | None = None
-    memory_mode: str | None = None
-
-
-loaded = LoadedPipeline()
+# 模型加载和出图都在独立的工作进程里（app/engine.py），这里只管调度
+worker = GenerationWorker()
 generation_lock = Lock()
+latest_torch_memory: dict[str, Any] = {"available": False}
 latest_generation_metrics: dict[str, Any] | None = None
 # 当前生成进度：phase = idle / loading / denoising / saving
 progress: dict[str, Any] = {"phase": "idle", "step": 0, "total": 0, "started": None}
 
 
-def _import_torch_and_diffusers() -> tuple[Any, Any]:
-    try:
-        import torch
-        from diffusers import AutoPipelineForText2Image
-    except ImportError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "依赖尚未安装完整。请先在虚拟环境中安装 requirements.txt "
-                "以及带 CUDA 的 PyTorch。"
-            ),
-        ) from exc
-    return torch, AutoPipelineForText2Image
+@app.on_event("startup")
+def _start_local_llm() -> None:
+    """网页服务一启动就把本地 LLM 拉起来（后台加载，不挡住网页）。"""
+    if not local_llm.autostart_enabled():
+        return
+
+    def run() -> None:
+        # 和出图共用一把锁：万一用户抢先点了生成，就不再和生图模型抢显存
+        with generation_lock:
+            if worker.state.get("model_key") is None:
+                try:
+                    llm.start()
+                except HTTPException:
+                    pass  # 模型文件不在；网页上会显示原因
+
+    Thread(target=run, daemon=True, name="llm-autostart").start()
+
+
+@app.on_event("shutdown")
+def _stop_background_processes() -> None:
+    llm.stop()
+    worker.stop()
 
 
 def _resolve_user_path(raw_path: str) -> Path:
@@ -209,234 +222,42 @@ class GpuSampler:
             self.samples.append(_gpu_snapshot())
 
 
-def _torch_memory_snapshot(torch: Any) -> dict[str, Any]:
-    if not torch.cuda.is_available():
-        return {"available": False}
-    return {
-        "available": True,
-        "allocated_mb": round(torch.cuda.memory_allocated() / 1024 / 1024, 1),
-        "reserved_mb": round(torch.cuda.memory_reserved() / 1024 / 1024, 1),
-        "max_allocated_mb": round(torch.cuda.max_memory_allocated() / 1024 / 1024, 1),
-        "max_reserved_mb": round(torch.cuda.max_memory_reserved() / 1024 / 1024, 1),
-    }
-
-
-def _is_sdxl_single_file(model_path: Path) -> bool:
-    if model_path.suffix.lower() != ".safetensors":
-        return False
-    try:
-        import json
-        import struct
-
-        with open(model_path, "rb") as f:
-            header_size = struct.unpack("<Q", f.read(8))[0]
-            header = json.loads(f.read(header_size))
-        return any(key.startswith("conditioner.embedders.1") for key in header)
-    except (OSError, ValueError, struct.error):
-        return False
-
-
-def _unload_current_pipeline() -> None:
-    """把当前模型从显存和内存里卸掉。"""
-    import gc
-
-    old_pipe = loaded.pipe
-    loaded.pipe = None
-    loaded.model_key = None
-    loaded.lora_key = None
-    loaded.lora_scale = None
-    loaded.memory_mode = None
-    if old_pipe is None:
-        return
-    if hasattr(old_pipe, "remove_all_hooks"):
-        old_pipe.remove_all_hooks()
-    try:
-        old_pipe.to("cpu")
-    except Exception:  # noqa: BLE001 - 已经 offload 的管线可能不允许 .to()
-        pass
-    del old_pipe
-    gc.collect()
-    try:
-        import torch
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except ImportError:
-        pass
-
-
-def _model_source(model_key: str) -> str:
-    """内置模型从 models/ 目录加载；其他的按路径或 Hugging Face ID 处理。"""
-    preset = catalog.model_by_id(model_key)
-    if preset:
-        if not catalog.model_installed(preset):
-            hint = "先在「模型库」里下载。" if preset.get("downloadable") else "文件不在 models/ 目录里。"
-            raise HTTPException(status_code=400, detail=f"{preset['label']} 还没下载。{hint}")
-        return str(catalog.model_path(preset))
-    model_path = _resolve_user_path(model_key)
-    return str(model_path) if model_path.exists() else model_key
-
-
-def _load_zimage(model_key: str, torch: Any, device: str, lora_key: str, lora_scale: float) -> Any:
-    """Z-Image Turbo：6B DiT + Qwen3 文本编码器，bf16 约 20GB，16GB 显卡要靠 offload。
-
-    LoRA 在这里先“合并”进 bf16 权重，再决定要不要转 fp8 存储。
-    如果先转 fp8 再挂 LoRA，PEFT 新建的 LoRA 层也会是 fp8，CUDA 矩阵乘不支持，会报
-    "addmm_cuda not implemented for Float8_e4m3fn"。代价是换 LoRA 或权重要重新加载模型。
-    """
-    from diffusers import ZImagePipeline
-
-    source = _model_source(model_key)
-    pipe = ZImagePipeline.from_pretrained(source, torch_dtype=torch.bfloat16)
-    if lora_key:
-        resolved_lora = _resolve_lora_path(lora_key)
-        try:
-            pipe.load_lora_weights(str(resolved_lora), adapter_name="local_lora")
-            pipe.fuse_lora(lora_scale=lora_scale)
-            pipe.unload_lora_weights()  # 去掉 LoRA 层，合并后的权重保留
-        except Exception as exc:  # noqa: BLE001
-            del pipe
-            raise HTTPException(
-                status_code=400,
-                detail=f"LoRA 加载失败，多半是它和 Z-Image 模型不匹配。原始错误：{str(exc)[:200]}",
-            ) from exc
-    loaded.lora_key = lora_key or None
-    loaded.lora_scale = lora_scale if lora_key else None
-    if device != "cuda":
-        return pipe
-
-    free_bytes, _ = torch.cuda.mem_get_info()
-    # 显存不够整块放下 12GB 的 transformer 时，用 fp8 存权重、bf16 计算，显存占用减半，画质几乎无损。
-    if free_bytes < 15 * 1024**3 and hasattr(pipe.transformer, "enable_layerwise_casting"):
-        pipe.transformer.enable_layerwise_casting(storage_dtype=torch.float8_e4m3fn, compute_dtype=torch.bfloat16)
-        loaded.memory_mode = "fp8 权重 + CPU offload"
-    else:
-        loaded.memory_mode = "CPU offload"
-    pipe.enable_model_cpu_offload()
-    return pipe
-
-
-def _resolve_lora_path(lora_key: str) -> Path:
-    resolved = _resolve_user_path(lora_key)
-    if resolved.exists():
-        return resolved
-    # 旧图片记录里的路径（例如 loras/xxx.safetensors）在整理目录后换了位置，按文件名再找一次
-    name = Path(lora_key).name
-    matches = [p for p in LORA_DIR.rglob(name) if p.is_file()]
-    if matches:
-        return matches[0]
-    raise HTTPException(status_code=400, detail=f"LoRA 文件不存在：{lora_key}。可能已被删除，可以在 LoRA 库里重新下载。")
-
-
-def _load_pipeline(model: str, lora_path: str, lora_scale: float) -> tuple[Any, Any]:
-    torch, AutoPipelineForText2Image = _import_torch_and_diffusers()
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype = torch.float16 if device == "cuda" else torch.float32
-    model_key = model.strip() or DEFAULT_MODEL
-    lora_key = lora_path.strip()
-
-    family = catalog.family_of_model(model_key)
-    zimage_lora_changed = family == "zimage" and (
-        (lora_key or None) != loaded.lora_key or (bool(lora_key) and lora_scale != loaded.lora_scale)
-    )
-    if loaded.pipe is None or loaded.model_key != model_key or zimage_lora_changed:
-        if loaded.pipe is not None:
-            _unload_current_pipeline()
-
-        if family == "zimage":
-            loaded.pipe = _load_zimage(model_key, torch, device, lora_key, lora_scale)
-            loaded.model_key = model_key
-    if family == "zimage":
-        # LoRA 已在加载时合并，不走下面的动态挂载
-        return loaded.pipe, torch
-
-    if loaded.pipe is None or loaded.model_key != model_key:
-        source_str = _model_source(model_key)
-        model_path = Path(source_str) if Path(source_str).exists() else None
-        load_kwargs = {
-            "torch_dtype": dtype,
-            "use_safetensors": True,
-        }
-        if model_path and model_path.is_file():
-            from diffusers import StableDiffusionPipeline, StableDiffusionXLPipeline
-
-            pipeline_cls = (
-                StableDiffusionXLPipeline
-                if _is_sdxl_single_file(model_path)
-                else StableDiffusionPipeline
-            )
-            pipe = pipeline_cls.from_single_file(str(model_path), **load_kwargs)
-        else:
-            source = str(model_path) if model_path else model_key
-            if device == "cuda":
-                load_kwargs["variant"] = "fp16"
-            try:
-                pipe = AutoPipelineForText2Image.from_pretrained(source, **load_kwargs)
-            except (OSError, ValueError):
-                load_kwargs.pop("variant", None)
-                pipe = AutoPipelineForText2Image.from_pretrained(source, **load_kwargs)
-
-        pipe.to(device)
-        loaded.memory_mode = "全部在显存" if device == "cuda" else "CPU"
-        if hasattr(pipe, "enable_attention_slicing"):
-            pipe.enable_attention_slicing()
-        if hasattr(pipe, "enable_vae_slicing"):
-            pipe.enable_vae_slicing()
-
-        loaded.pipe = pipe
-        loaded.model_key = model_key
-        loaded.lora_key = None
-        loaded.lora_scale = None
-
-    if loaded.pipe is None:
-        raise HTTPException(status_code=500, detail="模型加载失败。")
-
-    lora_changed = lora_key != loaded.lora_key or (bool(lora_key) and lora_scale != loaded.lora_scale)
-    if lora_changed:
-        if loaded.lora_key and hasattr(loaded.pipe, "unload_lora_weights"):
-            loaded.pipe.unload_lora_weights()
-        if lora_key:
-            resolved_lora = _resolve_lora_path(lora_key)
-            try:
-                loaded.pipe.load_lora_weights(str(resolved_lora), adapter_name="local_lora")
-            except Exception as exc:  # noqa: BLE001
-                loaded.lora_key = None
-                try:
-                    loaded.pipe.unload_lora_weights()
-                except Exception:  # noqa: BLE001
-                    pass
-                family = catalog.family_of_model(model_key)
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"LoRA 加载失败，多半是它和当前 {catalog.FAMILY_LABELS.get(family, family)} 模型不匹配。原始错误：{str(exc)[:200]}",
-                ) from exc
-            if hasattr(loaded.pipe, "set_adapters"):
-                loaded.pipe.set_adapters(["local_lora"], adapter_weights=[lora_scale])
-        loaded.lora_key = lora_key
-        loaded.lora_scale = lora_scale if lora_key else None
-
-    return loaded.pipe, torch
+LEGACY_GROUP_GAP = 90  # 秒：没有批次号的旧图，提示词相同且相隔不超过这么久就算同一次生成
 
 
 def _image_records() -> list[dict[str, str]]:
     records: list[dict[str, str]] = []
-    for image_path in sorted(OUTPUT_DIR.glob("*.png"), key=lambda p: p.stat().st_mtime, reverse=True):
+    newest = sorted(OUTPUT_DIR.glob("*.png"), key=lambda p: p.stat().st_mtime, reverse=True)[:60]
+    previous: dict[str, Any] | None = None  # 上一张（更新的那张）没有批次号的旧图
+    for image_path in newest:
         metadata_path = image_path.with_suffix(".json")
-        prompt = ""
+        meta: dict[str, Any] = {}
         if metadata_path.exists():
             try:
-                prompt = json.loads(metadata_path.read_text(encoding="utf-8")).get("prompt", "")
+                loaded_meta = json.loads(metadata_path.read_text(encoding="utf-8"))
+                meta = loaded_meta if isinstance(loaded_meta, dict) else {}
             except (OSError, json.JSONDecodeError):
-                prompt = ""
+                meta = {}
+        prompt = str(meta.get("prompt") or "")
+        mtime = image_path.stat().st_mtime
+        if "batch" in meta:
+            group = str(meta["batch"] or "")
+            previous = None
+        else:
+            # 加批次号之前生成的图：按“提示词相同、时间挨着”推断
+            same = previous is not None and bool(prompt) and previous["prompt"] == prompt and previous["mtime"] - mtime <= LEGACY_GROUP_GAP
+            group = previous["group"] if same else f"legacy-{image_path.stem}"
+            previous = {"prompt": prompt, "mtime": mtime, "group": group}
         records.append(
             {
                 "name": image_path.name,
                 "url": f"/outputs/{image_path.name}",
                 "prompt": prompt,
-                "created_at": datetime.fromtimestamp(image_path.stat().st_mtime).isoformat(timespec="seconds"),
+                "group": group,
+                "created_at": datetime.fromtimestamp(mtime).isoformat(timespec="seconds"),
             }
         )
-    return records[:60]
+    return records
 
 
 def _guess_lora_family(lora_path: Path) -> str | None:
@@ -482,7 +303,7 @@ def _lora_records() -> list[dict[str, Any]]:
                 "catalog_id": item["id"] if item else None,
                 "trigger": item["trigger"] if item else "",
                 "weight": item["weight"] if item else None,
-                "in_use": loaded.lora_key == relative_path,
+                "in_use": worker.state.get("lora_key") == relative_path,
             }
         )
     return records
@@ -514,6 +335,41 @@ def _resolve_output_image(name: str) -> Path:
     return image_path
 
 
+def _store_init_image(raw: str) -> Path:
+    """把参考图存到 outputs/refs/（按内容命名，同一张图只存一份），返回文件路径。"""
+    from PIL import Image, ImageOps, UnidentifiedImageError
+
+    raw = raw.strip()
+    output_root = OUTPUT_DIR.resolve()
+    if raw.startswith("/outputs/"):
+        source = (OUTPUT_DIR / raw[len("/outputs/") :].split("?", 1)[0]).resolve()
+        if output_root not in source.parents or not source.is_file():
+            raise HTTPException(status_code=400, detail="参考图已经不存在，请重新选择。")
+        if source.parent == REF_DIR.resolve():
+            return source
+        data = source.read_bytes()
+    elif raw.startswith("data:image/") and ";base64," in raw:
+        try:
+            data = base64.b64decode(raw.split(";base64,", 1)[1], validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="参考图数据损坏，请重新选择。") from exc
+    else:
+        raise HTTPException(status_code=400, detail="参考图格式不支持。")
+
+    target = REF_DIR / f"{hashlib.sha1(data).hexdigest()[:20]}.png"
+    if target.exists():
+        return target
+    try:
+        with Image.open(io.BytesIO(data)) as source_image:
+            image = ImageOps.exif_transpose(source_image).convert("RGB")
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="参考图不是可识别的图片。") from exc
+    image.thumbnail((2048, 2048), Image.Resampling.LANCZOS)
+    REF_DIR.mkdir(exist_ok=True)
+    image.save(target)
+    return target
+
+
 @app.get("/")
 def index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
@@ -531,18 +387,20 @@ def status() -> dict[str, Any]:
             "default_model": DEFAULT_MODEL,
         }
 
-    cuda = torch.cuda.is_available()
+    gpu_metrics = _gpu_snapshot()
+    cuda = bool(torch.version.cuda) and gpu_metrics.get("available", False)
     return {
         "ready": True,
         "device": "cuda" if cuda else "cpu",
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
-        "gpu": torch.cuda.get_device_name(0) if cuda else "",
+        "gpu": gpu_metrics.get("name", "") if cuda else "",
         "default_model": DEFAULT_MODEL,
-        "loaded_model": loaded.model_key,
-        "loaded_lora": loaded.lora_key,
-        "memory_mode": loaded.memory_mode,
-        "gpu_metrics": _gpu_snapshot(),
+        "loaded_model": worker.state.get("model_key"),
+        "loaded_lora": worker.state.get("lora_key"),
+        "memory_mode": worker.state.get("memory_mode"),
+        "worker_alive": worker.alive(),
+        "gpu_metrics": gpu_metrics,
         "latest_generation_metrics": latest_generation_metrics,
         "safety_mode": "diffusers_default",
     }
@@ -550,18 +408,9 @@ def status() -> dict[str, Any]:
 
 @app.get("/api/gpu")
 def gpu() -> dict[str, Any]:
-    try:
-        import torch
-    except ImportError:
-        return {
-            "gpu": _gpu_snapshot(),
-            "torch_memory": {"available": False},
-            "latest_generation_metrics": latest_generation_metrics,
-        }
-
     return {
         "gpu": _gpu_snapshot(),
-        "torch_memory": _torch_memory_snapshot(torch),
+        "torch_memory": latest_torch_memory if worker.alive() else {"available": False},
         "latest_generation_metrics": latest_generation_metrics,
         "progress": progress,
     }
@@ -582,22 +431,15 @@ def optimize_prompt(request: PromptOptimizeRequest) -> dict[str, Any]:
     model_id = request.target_model.strip() or DEFAULT_MODEL
     preset = catalog.model_by_id(model_id)
     label = preset["label"] if preset else model_id
-    return prompt_ai.optimize(request.text, request.style, catalog.family_of_model(model_id), label)
+    # 和出图互斥：LLM 和生图模型同时算会把 16GB 显存挤爆。先让生图模型把显存让出来（权重留在内存里，不用重新加载）
+    with generation_lock:
+        worker.park()
+        return prompt_ai.optimize(request.text, request.style, catalog.family_of_model(model_id), label)
 
 
 @app.get("/api/settings")
 def settings() -> dict[str, Any]:
-    return {"claude": prompt_ai.settings_view()}
-
-
-@app.post("/api/settings/claude")
-def save_claude_key(request: ClaudeKeyRequest) -> dict[str, Any]:
-    return {"claude": prompt_ai.save_key(ROOT_DIR, request.api_key)}
-
-
-@app.delete("/api/settings/claude")
-def delete_claude_key() -> dict[str, Any]:
-    return {"claude": prompt_ai.delete_key(ROOT_DIR)}
+    return {"llm": prompt_ai.settings_view()}
 
 
 @app.get("/api/models")
@@ -610,7 +452,7 @@ def models() -> dict[str, Any]:
                 "installed": catalog.model_installed(model),
                 "disk_gb": round(catalog.model_disk_bytes(model) / 1e9, 2),
                 "path": catalog.model_relpath(model),
-                "in_use": loaded.model_key == model["id"],
+                "in_use": worker.state.get("model_key") == model["id"],
                 "defaults": catalog.FAMILY_DEFAULTS[model["family"]],
                 "page": None if model.get("local") else f"https://huggingface.co/{model['id']}",
                 "job": jobs.get(model["id"]),
@@ -634,8 +476,8 @@ def delete_model(id: str) -> dict[str, Any]:  # noqa: A002 - 与前端参数名�
     if not generation_lock.acquire(timeout=1):
         raise HTTPException(status_code=409, detail="正在生成图片，等生成结束再删除。")
     try:
-        if loaded.model_key == id and loaded.pipe is not None:
-            _unload_current_pipeline()
+        if worker.state.get("model_key") == id:
+            worker.stop()
         freed = catalog.model_disk_bytes(model)
         removed = catalog.delete_model_files(model)
     finally:
@@ -697,9 +539,9 @@ def delete_lora_file(path: str) -> dict[str, Any]:
         raise HTTPException(status_code=409, detail="正在生成图片，等生成结束再删除。")
     try:
         relative = target.relative_to(ROOT_DIR).as_posix()
-        if loaded.lora_key == relative and loaded.pipe is not None:
-            # Z-Image 的 LoRA 已合并进权重，卸不掉，只能整个模型卸载
-            _unload_current_pipeline()
+        if worker.state.get("lora_key") == relative:
+            # LoRA 可能已合并进权重，直接结束工作进程最干净
+            worker.stop()
         size = target.stat().st_size
         target.unlink()
     finally:
@@ -747,72 +589,84 @@ def generate(request: GenerateRequest) -> dict[str, Any]:
 
 
 def _generate(request: GenerateRequest) -> dict[str, Any]:
-    global latest_generation_metrics
+    global latest_generation_metrics, latest_torch_memory
+
+    init_path: Path | None = None
+    init_url = ""
+    total_steps = request.steps
+    if request.init_image.strip():
+        # 图生图跳过开头的 步数 × (1 − 重绘幅度) 步（向下取整），只跑剩下的；和 diffusers 的 get_timesteps 一致
+        total_steps = request.steps - int(max(request.steps - request.steps * request.strength, 0))
+        init_path = _store_init_image(request.init_image)
+        init_url = f"/outputs/refs/{init_path.name}"
 
     with generation_lock:
         # 从拿到锁开始计时，排队等待的时间不算进耗时
         started = time.time()
+        # 出图前结束本地 LLM，把它占的显存整块还给生图模型；下次「转写」时会自动再启动
+        llm.stop()
         model_key = request.model.strip() or DEFAULT_MODEL
-        needs_load = loaded.model_key != model_key or (
-            catalog.family_of_model(model_key) == "zimage"
-            and ((request.lora_path.strip() or None) != loaded.lora_key or request.lora_scale != (loaded.lora_scale or request.lora_scale))
-        )
-        progress.update(phase="loading" if needs_load else "denoising", step=0, total=request.steps, started=started)
+        lora_key = request.lora_path.strip()
+        needs_load = worker.needs_fresh_process(model_key, lora_key, request.lora_scale) or worker.state.get("model_key") is None
+        progress.update(phase="loading" if needs_load else "denoising", step=0, total=total_steps, started=started)
+
+        seed = request.seed if request.seed is not None else random.randrange(2**32)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        image_name = f"{timestamp}_seed-{int(seed)}.png"
+        image_path = OUTPUT_DIR / image_name
+        job = {
+            "prompt": request.prompt,
+            "negative_prompt": request.negative_prompt,
+            "model": model_key,
+            "lora_path": lora_key,
+            "lora_scale": request.lora_scale,
+            "width": request.width,
+            "height": request.height,
+            "steps": request.steps,
+            "guidance_scale": request.guidance_scale,
+            "seed": int(seed),
+            "image_path": str(image_path),
+            "init_image_path": str(init_path) if init_path else "",
+            "strength": request.strength,
+        }
+
         before_load_gpu = _gpu_snapshot()
+        timing: dict[str, Any] = {"after_load": None, "sampler": None}
+
+        def on_message(message: dict[str, Any]) -> None:
+            if message["type"] == "loaded":
+                progress.update(phase="denoising", step=0)
+                timing["after_load"] = _gpu_snapshot()
+                timing["sampler"] = GpuSampler()
+                timing["sampler"].start()
+            elif message["type"] == "progress":
+                progress.update(step=message["step"])
+
         try:
-            pipe, torch = _load_pipeline(request.model, request.lora_path, request.lora_scale)
-        except Exception:
-            progress.update(phase="idle")
-            raise
-        progress.update(phase="denoising", step=0)
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        seed = request.seed if request.seed is not None else torch.seed() % (2**32)
-        generator = torch.Generator(device=device).manual_seed(seed)
-        after_load_gpu = _gpu_snapshot()
+            reply = worker.generate(job, on_message)
+        except WorkerCrashed as exc:
+            if timing["sampler"]:
+                timing["sampler"].stop()
+            latest_generation_metrics = {"ok": False, "seconds": round(time.time() - started, 2), "error": "worker crashed"}
+            raise HTTPException(status_code=500, detail=crash_detail(exc.args[0] if exc.args else None)) from exc
 
-        if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()
-
-        sampler = GpuSampler()
-        sampler.start()
-
-        def on_step_end(_pipe: Any, step: int, _timestep: Any, callback_kwargs: dict[str, Any]) -> dict[str, Any]:
-            progress.update(step=step + 1)
-            return callback_kwargs
-
-        # Turbo 这类 CFG=0 的蒸馏模型不用反向提示词
-        use_negative = bool(request.negative_prompt) and request.guidance_scale > 1.0
-        try:
-            result = pipe(
-                prompt=request.prompt,
-                negative_prompt=request.negative_prompt if use_negative else None,
-                width=request.width,
-                height=request.height,
-                num_inference_steps=request.steps,
-                guidance_scale=request.guidance_scale,
-                generator=generator,
-                callback_on_step_end=on_step_end,
-            )
-        except RuntimeError as exc:
-            progress.update(phase="idle")
-            samples = sampler.stop()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            peak_memory_sample = _peak_sample(samples, "memory_used_mb")
-            peak_util_sample = _peak_sample(samples, "utilization_percent")
+        samples = timing["sampler"].stop() if timing["sampler"] else []
+        after_load_gpu = timing["after_load"] or before_load_gpu
+        if reply["type"] == "error":
             latest_generation_metrics = {
                 "ok": False,
                 "seconds": round(time.time() - started, 2),
                 "before_load": before_load_gpu,
                 "after_load": after_load_gpu,
-                "peak_memory": peak_memory_sample,
-                "peak_utilization": peak_util_sample,
-                "error": str(exc),
+                "peak_memory": _peak_sample(samples, "memory_used_mb"),
+                "peak_utilization": _peak_sample(samples, "utilization_percent"),
+                "error": reply.get("detail"),
             }
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
-        samples = sampler.stop()
+            raise_for_error(reply)
+
         after_gpu = _gpu_snapshot()
-        torch_memory = _torch_memory_snapshot(torch)
+        torch_memory = reply.get("torch_memory") or {"available": False}
+        latest_torch_memory = torch_memory
         peak_memory_sample = _peak_sample(samples, "memory_used_mb")
         peak_util_sample = _peak_sample(samples, "utilization_percent")
         peak_power_sample = _peak_sample(samples, "power_w")
@@ -843,13 +697,8 @@ def _generate(request: GenerateRequest) -> dict[str, Any]:
         latest_generation_metrics = gpu_metrics
         progress.update(phase="saving")
 
-        image = result.images[0]
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_seed = int(seed)
-        image_name = f"{timestamp}_seed-{safe_seed}.png"
-        image_path = OUTPUT_DIR / image_name
         metadata_path = image_path.with_suffix(".json")
-        image.save(image_path)
         metadata_path.write_text(
             json.dumps(
                 {
@@ -863,6 +712,9 @@ def _generate(request: GenerateRequest) -> dict[str, Any]:
                     "steps": request.steps,
                     "guidance_scale": request.guidance_scale,
                     "seed": safe_seed,
+                    "init_image": init_url,
+                    "strength": request.strength if init_url else None,
+                    "batch": request.batch,
                     "seconds": round(time.time() - started, 2),
                     "gpu_metrics": gpu_metrics,
                 },
@@ -877,6 +729,7 @@ def _generate(request: GenerateRequest) -> dict[str, Any]:
         "url": f"/outputs/{image_name}",
         "path": str(image_path),
         "seed": safe_seed,
+        "init_image": init_url,
         "seconds": round(time.time() - started, 2),
         "gpu_metrics": gpu_metrics,
         "images": _image_records(),

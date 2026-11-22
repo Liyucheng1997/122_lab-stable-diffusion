@@ -11,8 +11,8 @@
         document.documentElement.dataset.theme = dark ? "dark" : "light";
       } catch (e) {}
     </script>
-    <link rel="stylesheet" href="/static/tokens.css?v=11" />
-    <link rel="stylesheet" href="/static/styles.css?v=11" />
+    <link rel="stylesheet" href="/static/tokens.css?v=13" />
+    <link rel="stylesheet" href="/static/styles.css?v=16" />
   </head>
   <body>
     <div id="app">
@@ -48,7 +48,7 @@
                 <div id="promptHelper" class="helper" hidden>
                   <div class="field">
                     <span class="field-label"><label for="cnPrompt">中文描述</label>
-                      <span class="field-hint"><span id="promptHelperStatus">Claude Opus 5.5</span> · <button id="claudeKeyBtn" class="link-btn" type="button">API Key</button></span>
+                      <span class="field-hint"><span id="promptHelperStatus">本地模型</span></span>
                     </span>
                     <textarea id="cnPrompt" class="input" rows="3" placeholder="例如：一只机械猫站在雨夜的霓虹街道上，电影感，细节丰富"></textarea>
                   </div>
@@ -119,11 +119,44 @@
                     </div>
                   </div>
                   <p id="loraHint" class="hint" hidden></p>
-                  <p id="zimageLoraNote" class="field-note" hidden>Z-Image 换 LoRA 或改权重时要重新加载模型，第一张图会多等约 1 分钟。</p>
                   <details class="adv">
                     <summary>手动指定 LoRA 路径</summary>
                     <input id="loraPath" class="input" placeholder="loras/style.safetensors" />
                   </details>
+                </div>
+              </section>
+
+              <section class="section">
+                <div class="section-head">
+                  <h2 class="section-title">参考图</h2>
+                  <span id="refTag" class="tag">文生图</span>
+                </div>
+                <div class="stack">
+                  <input id="refFile" type="file" accept="image/*" hidden />
+                  <button id="refDrop" class="ref-drop" type="button">
+                    <span data-icon="image" data-size="20"></span>
+                    <span>点击选图、拖进来，或直接 Ctrl + V 粘贴</span>
+                    <span class="ref-drop-sub">不放参考图就是文生图</span>
+                  </button>
+                  <div id="refBox" class="ref-box" hidden>
+                    <img id="refThumb" alt="参考图" />
+                    <div class="ref-info">
+                      <div id="refSize" class="ref-size tabular"></div>
+                      <div class="field-note">会按下面的画面尺寸居中裁剪</div>
+                      <div class="ref-actions">
+                        <button id="refChangeBtn" class="link-btn" type="button">换一张</button>
+                        <button id="refClearBtn" class="link-btn" type="button">移除</button>
+                      </div>
+                    </div>
+                  </div>
+                  <div class="field" id="strengthField" hidden>
+                    <span class="field-label">重绘幅度</span>
+                    <div class="slider-row">
+                      <input id="strengthRange" type="range" min="0.05" max="1" step="0.05" value="0.6" />
+                      <input id="strength" class="input num" type="number" min="0.05" max="1" step="0.05" value="0.6" />
+                    </div>
+                    <span id="strengthNote" class="field-note"></span>
+                  </div>
                 </div>
               </section>
 
@@ -176,13 +209,22 @@
                       <button id="seedRandomBtn" class="icon-btn icon-btn-fill" type="button" title="改回随机" data-icon="shuffle"></button>
                     </div>
                   </label>
+                  <div class="field">
+                    <span class="field-label">生成张数</span>
+                    <div class="slider-row">
+                      <input id="countRange" type="range" min="1" max="8" step="1" value="1" />
+                      <input id="count" class="input num" type="number" min="1" max="8" step="1" value="1" />
+                    </div>
+                    <span id="countNote" class="field-note" hidden></span>
+                  </div>
                 </div>
               </section>
             </div>
 
             <div class="sidebar-footer">
               <button id="generateBtn" class="btn btn-primary btn-lg" type="submit">生成图片</button>
-              <div class="kbd-hint">Ctrl + Enter 快速生成</div>
+              <button id="stopBatchBtn" class="link-btn stop-batch" type="button" hidden>这张完成后停止</button>
+              <div id="kbdHint" class="kbd-hint">Ctrl + Enter 快速生成</div>
             </div>
           </form>
         </aside>
@@ -196,6 +238,7 @@
                 <p id="runInfo" class="card-sub">图片会自动保存到 outputs 目录。</p>
               </div>
               <div class="card-actions">
+                <button id="useRefBtn" class="btn btn-sm" type="button" disabled>作为参考图</button>
                 <button id="useSeedBtn" class="btn btn-sm" type="button" disabled>固定此 Seed</button>
                 <a id="downloadLink" class="btn btn-sm is-disabled" href="#" download><span data-icon="download"></span>下载</a>
               </div>
@@ -263,6 +306,6 @@
       </div>
     </div>
     <div id="toastHost" class="toast-host"></div>
-    <script src="/static/app.js?v=11"></script>
+    <script src="/static/app.js?v=16"></script>
   </body>
 </html>

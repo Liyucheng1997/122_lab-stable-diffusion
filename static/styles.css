@@ -277,13 +277,32 @@ select.input { cursor: pointer; }
 .param-hint { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; margin-top: -4px; color: var(--warning); }
 .param-hint .link-btn { flex: none; }
 
-/* ---------- Claude API Key ---------- */
 .field-hint .link-btn { font-size: 12px; }
-.link-btn.is-missing { color: var(--warning); }
-.key-modal { width: min(460px, calc(100vw - 32px)); }
-.key-modal .modal-body { display: flex; flex-direction: column; gap: 12px; }
-.key-desc { font-size: 13px; line-height: 1.65; color: var(--text-2); }
-.key-status { display: flex; align-items: center; gap: 7px; font-size: 13px; font-weight: 500; font-variant-numeric: tabular-nums; }
-.key-input { font-family: var(--mono); }
-.key-link { align-self: flex-start; }
-.key-modal .btn .spinner { width: 14px; height: 14px; border-width: 2px; }
+
+/* ---------- 参考图（图生图） / 多张 ---------- */
+.ref-drop { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; width: 100%; min-height: 92px; padding: 12px; border: 1.5px dashed var(--line-strong); border-radius: var(--r); background: transparent; color: var(--text-2); font-size: 12.5px; text-align: center; transition: border-color 0.15s, background 0.15s, color 0.15s; }
+.ref-drop:hover, .ref-drop.is-over { border-color: var(--primary); background: var(--primary-soft); color: var(--primary); }
+.ref-drop-sub { font-size: 11.5px; color: var(--text-3); }
+.ref-box { display: flex; align-items: center; gap: 12px; padding: 10px; border-radius: var(--r); background: var(--panel-2); }
+.ref-box.is-over { box-shadow: 0 0 0 2px var(--primary); }
+.ref-box img { width: 76px; height: 76px; flex: none; object-fit: cover; border-radius: 8px; background: var(--canvas); }
+.ref-info { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.ref-size { font-size: 13px; font-weight: 500; }
+.ref-actions { display: flex; gap: 14px; margin-top: 3px; }
+.stop-batch { align-self: center; }
+
+/* ---------- 历史：同一次生成的图片叠成一摞，点击弹出 ---------- */
+.stack-wrap { position: relative; aspect-ratio: 1; }
+.stack-wrap .thumb-media { position: absolute; left: 0; top: 0; width: 78%; height: 78%; aspect-ratio: auto; z-index: 2; cursor: pointer; box-shadow: 0 2px 10px rgba(0, 0, 0, 0.22); }
+.stack-layer { position: absolute; width: 78%; height: 78%; object-fit: cover; border-radius: 12px; background: var(--canvas); box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18); transition: transform 0.3s var(--ease-out), filter 0.3s; }
+.stack-layer.l1 { left: 11%; top: 11%; z-index: 1; filter: brightness(0.86); }
+.stack-layer.l2 { left: 22%; top: 22%; z-index: 0; filter: brightness(0.72); }
+.thumb-stack:hover .stack-layer.l1 { transform: translate(3px, 3px) rotate(2deg); filter: brightness(0.94); }
+.thumb-stack:hover .stack-layer.l2 { transform: translate(6px, 6px) rotate(4deg); filter: brightness(0.84); }
+.thumb-stack:hover .thumb-media { transform: translate(-2px, -2px); box-shadow: var(--shadow-lift); }
+.stack-badge { position: absolute; left: 8px; bottom: 8px; height: 22px; padding: 0 9px; border-radius: 99px; background: rgba(29, 29, 31, 0.78); color: #fff; font-size: 12px; font-weight: 500; display: inline-flex; align-items: center; font-variant-numeric: tabular-nums; }
+.folder { width: min(920px, calc(100vw - 32px)); }
+.folder-prompt { padding: 2px 24px 0; font-size: 12.5px; line-height: 1.5; color: var(--text-3); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.folder-body { padding: 16px 24px 8px; overflow: auto; }
+.group-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 14px 12px; }
+@media (max-width: 560px) { .group-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .folder-body, .folder-prompt { padding-left: 16px; padding-right: 16px; } }

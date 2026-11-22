@@ -219,6 +219,24 @@ const busyBar = $("#busyBar");
 const paramHint = $("#paramHint");
 const paramHintText = $("#paramHintText");
 const paramResetBtn = $("#paramResetBtn");
+const refFile = $("#refFile");
+const refDrop = $("#refDrop");
+const refBox = $("#refBox");
+const refThumb = $("#refThumb");
+const refSize = $("#refSize");
+const refTag = $("#refTag");
+const refChangeBtn = $("#refChangeBtn");
+const refClearBtn = $("#refClearBtn");
+const strengthField = $("#strengthField");
+const strengthInput = $("#strength");
+const strengthRange = $("#strengthRange");
+const strengthNote = $("#strengthNote");
+const countInput = $("#count");
+const countRange = $("#countRange");
+const countNote = $("#countNote");
+const stopBatchBtn = $("#stopBatchBtn");
+const kbdHint = $("#kbdHint");
+const useRefBtn = $("#useRefBtn");
 
 const FORM_KEY = "aigen.form.v1";
 const CUSTOM = "__custom__";
@@ -241,6 +259,10 @@ let modelLibRender = null; // 模型库弹窗打开时的重绘函数
 let images = [];
 let currentResult = null; // { url, name, seed }
 let isBusy = false;
+let refImage = null; // 图生图参考图 { src: data URL 或 /outputs/ 下的地址, width, height }
+let refToken = 0;
+let batch = null; // 一次生成多张时的进度 { index, count }
+let stopRequested = false;
 let busyTimer = null;
 let lastProgress = null;
 let busyTimerTick = null;
@@ -423,12 +445,13 @@ function updateFamily(announce = true) {
   familyTag.textContent = FAMILY_LABELS[family] || family;
   familyTag.classList.toggle("primary", family !== "sd15");
   negHint.hidden = family !== "zimage";
-  $("#zimageLoraNote").hidden = family !== "zimage";
   syncRatioFromSize();
   renderLoraOptions();
   updateLoraHint();
   updateModelPanel();
   updateParamHint();
+  updateStrengthNote();
+  updateCountNote();
 }
 
 // 步数 / CFG 偏离当前模型的推荐值时，给出提示和一键恢复
@@ -524,11 +547,32 @@ function formPayload() {
     steps: readNumber(stepsInput),
     guidance_scale: readNumber(guidanceInput),
     seed: readNumber(seedInput),
+    strength: readStrength(),
   };
 }
 
+function readStrength() {
+  const value = Number(strengthInput.value);
+  return Number.isFinite(value) && value > 0 ? Math.max(0.05, Math.min(1, value)) : 0.6;
+}
+
+function readCount() {
+  const value = Math.round(Number(countInput.value));
+  return Number.isFinite(value) ? Math.max(1, Math.min(8, value)) : 1;
+}
+
 function saveForm() {
-  store.set(FORM_KEY, { ...formPayload(), prompt: promptInput.value, negative_prompt: negativeInput.value, cn: cnPrompt.value, style: promptStyle.value, mode: promptMode() });
+  store.set(FORM_KEY, {
+    ...formPayload(),
+    prompt: promptInput.value,
+    negative_prompt: negativeInput.value,
+    cn: cnPrompt.value,
+    style: promptStyle.value,
+    mode: promptMode(),
+    count: readCount(),
+    // 新选的参考图还只在浏览器里（data URL 太大不存），生成过一次、服务器存下后才记住
+    init_image: refImage?.src.startsWith("/outputs/") ? refImage.src : "",
+  });
 }
 
 function applyParams(params, { includeSeed = true } = {}) {
@@ -542,6 +586,9 @@ function applyParams(params, { includeSeed = true } = {}) {
   if (isNum(params.steps)) setPair(stepsInput, stepsRange, params.steps);
   if (isNum(params.guidance_scale)) setPair(guidanceInput, guidanceRange, params.guidance_scale);
   if (includeSeed) seedInput.value = isNum(params.seed) ? params.seed : "";
+  if (isNum(params.strength)) setPair(strengthInput, strengthRange, params.strength);
+  if (isNum(params.count)) setPair(countInput, countRange, params.count);
+  setRef(params.init_image || null);
   lastFamily = familyOf(currentModel());
   updateFamily(false);
   saveForm();
@@ -576,15 +623,147 @@ function bindPair(numberInput, rangeInput) {
 bindPair(loraScaleInput, loraScaleRange);
 bindPair(stepsInput, stepsRange);
 bindPair(guidanceInput, guidanceRange);
+bindPair(strengthInput, strengthRange);
+bindPair(countInput, countRange);
 for (const el of [stepsInput, stepsRange, guidanceInput, guidanceRange]) el.addEventListener("input", () => updateParamHint());
+for (const el of [stepsInput, stepsRange, strengthInput, strengthRange]) el.addEventListener("input", () => updateStrengthNote());
+for (const el of [countInput, countRange, seedInput]) el.addEventListener("input", () => updateCountNote());
 paramResetBtn.addEventListener("click", () => {
   const d = familyDefaults[familyOf(currentModel())];
   if (!d) return;
   setPair(stepsInput, stepsRange, d.steps);
   setPair(guidanceInput, guidanceRange, d.guidance_scale);
   updateParamHint();
+  updateStrengthNote();
   saveForm();
   toast(`已恢复推荐：${d.steps} 步 · CFG ${d.guidance_scale}`);
+});
+
+/* ---------------- 参考图（图生图） / 张数 ---------------- */
+function loadImage(src) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error("图片读取失败"));
+    img.src = src;
+  });
+}
+
+function renderRef() {
+  const on = !!refImage;
+  refDrop.hidden = on;
+  refBox.hidden = !on;
+  strengthField.hidden = !on;
+  refTag.textContent = on ? "图生图" : "文生图";
+  refTag.classList.toggle("primary", on);
+  if (on) {
+    refThumb.src = refImage.src;
+    refSize.textContent = `${refImage.width} × ${refImage.height}`;
+  } else {
+    refThumb.removeAttribute("src");
+  }
+  updateStrengthNote();
+}
+
+// 图生图跳过开头的 步数 × (1 − 重绘幅度) 步（向下取整），只跑剩下的，和管线、后端算法一致
+function updateStrengthNote() {
+  const steps = Number(stepsInput.value) || 0;
+  const real = steps - Math.floor(Math.max(steps - steps * readStrength(), 0));
+  strengthNote.textContent = `越小越接近原图，越大越自由发挥 · 实际去噪 ${real} / ${steps} 步`;
+}
+
+function updateCountNote() {
+  const count = readCount();
+  const seed = readNumber(seedInput);
+  countNote.hidden = count < 2;
+  if (count < 2) return;
+  countNote.textContent =
+    seed == null ? "逐张生成，每张用不同的随机 Seed，显存占用不变。" : `逐张生成，Seed 从 ${seed} 起每张加 1，显存占用不变。`;
+}
+
+// 参考图和哪个预设比例最接近，就把画面尺寸切过去，裁掉的最少
+function fitRatioToRef() {
+  if (!refImage) return;
+  const target = Math.log(refImage.width / refImage.height);
+  const off = (entry) => Math.abs(Math.log(entry[1][0] / entry[1][1]) - target);
+  const [ratio] = Object.entries(SIZES[familyOf(currentModel())]).reduce((best, entry) => (off(entry) < off(best) ? entry : best));
+  if (activeRatio() !== ratio) {
+    applyRatio(ratio);
+    toast(`已按参考图把画面比例切到 ${ratio}`, "info", 3000);
+  }
+}
+
+async function setRef(src, { fit = false } = {}) {
+  const token = ++refToken;
+  if (!src) {
+    refImage = null;
+    renderRef();
+    return;
+  }
+  try {
+    const img = await loadImage(src);
+    if (token !== refToken) return;
+    refImage = { src, width: img.naturalWidth, height: img.naturalHeight };
+  } catch {
+    if (token !== refToken) return;
+    refImage = null;
+    toast("参考图已经不存在，已改回文生图", "error", 3500);
+  }
+  renderRef();
+  if (refImage && fit) fitRatioToRef();
+  saveForm();
+}
+
+// 上传前在浏览器里把长边压到 2048 以内，传输小、也足够图生图用
+async function useRefFile(file) {
+  if (!file || !file.type.startsWith("image/")) {
+    toast("请选择图片文件", "error");
+    return;
+  }
+  const url = URL.createObjectURL(file);
+  try {
+    const img = await loadImage(url);
+    const scale = Math.min(1, 2048 / Math.max(img.naturalWidth, img.naturalHeight));
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(img.naturalWidth * scale));
+    canvas.height = Math.max(1, Math.round(img.naturalHeight * scale));
+    canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
+    await setRef(canvas.toDataURL("image/png"), { fit: true });
+  } catch {
+    toast("这张图片浏览器读不了，换一张试试", "error");
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+refDrop.addEventListener("click", () => refFile.click());
+refChangeBtn.addEventListener("click", () => refFile.click());
+refClearBtn.addEventListener("click", () => {
+  setRef(null);
+  saveForm();
+});
+refFile.addEventListener("change", () => {
+  useRefFile(refFile.files[0]);
+  refFile.value = "";
+});
+for (const zone of [refDrop, refBox]) {
+  zone.addEventListener("dragover", (event) => {
+    event.preventDefault();
+    zone.classList.add("is-over");
+  });
+  zone.addEventListener("dragleave", () => zone.classList.remove("is-over"));
+  zone.addEventListener("drop", (event) => {
+    event.preventDefault();
+    zone.classList.remove("is-over");
+    useRefFile(event.dataTransfer.files[0]);
+  });
+}
+document.addEventListener("paste", (event) => {
+  if ($(".modal-overlay")) return;
+  const file = Array.from(event.clipboardData?.files || []).find((f) => f.type.startsWith("image/"));
+  if (!file) return;
+  event.preventDefault();
+  useRefFile(file);
 });
 
 /* ---------------- 提示词模式 ---------------- */
@@ -612,7 +791,9 @@ async function optimizePrompt() {
   }
   optimizePromptBtn.disabled = true;
   $(".btn-text", optimizePromptBtn).textContent = "转写中…";
-  promptHelperStatus.textContent = "Claude 思考中…";
+  llmBusy = true;
+  // 模型不在显存里时（刚出过图）要先加载几秒
+  promptHelperStatus.textContent = llmSettings?.state === "ready" ? "本地模型转写中…" : "本地模型加载并转写中…";
   promptNotes.hidden = true;
   try {
     const response = await fetch("/api/prompt/optimize", {
@@ -621,17 +802,11 @@ async function optimizePrompt() {
       body: JSON.stringify({ text, style: promptStyle.value.trim(), target_model: currentModel() }),
     });
     const data = await response.json();
-    if (response.status === 428) {
-      promptHelperStatus.textContent = claudeSettings?.model || "Claude Opus 5.5";
-      toast(data.detail || "先设置 Claude API Key", "error", 3500);
-      openClaudeKeyDialog();
-      return;
-    }
     if (!response.ok) throw new Error(data.detail || "提示词优化失败");
     promptInput.value = data.prompt || "";
     // Z-Image 不用反向提示词，返回空时也清掉旧的，避免误会
     negativeInput.value = data.negative_prompt || (familyOf(currentModel()) === "zimage" ? "" : negativeInput.value);
-    promptHelperStatus.textContent = `已完成 · ${data.model || "Claude"}`;
+    promptHelperStatus.textContent = `已完成 · ${data.model || "本地模型"}`;
     promptNotes.textContent = data.notes || "";
     promptNotes.hidden = !data.notes;
     saveForm();
@@ -642,97 +817,26 @@ async function optimizePrompt() {
     promptNotes.hidden = false;
     toast("提示词优化失败", "error");
   } finally {
+    llmBusy = false;
     optimizePromptBtn.disabled = false;
     $(".btn-text", optimizePromptBtn).textContent = "转写为英文提示词";
   }
 }
 optimizePromptBtn.addEventListener("click", optimizePrompt);
 
-/* ---------------- Claude API Key ---------------- */
-let claudeSettings = null;
-const claudeKeyBtn = $("#claudeKeyBtn");
+/* ---------------- 本地 LLM 状态 ---------------- */
+let llmSettings = null;
+let llmBusy = false;
+const LLM_STATE_TEXT = { ready: "已就绪", loading: "加载中…", stopped: "待命，点转写时自动加载", missing: "不可用" };
 
 async function refreshSettings() {
   const response = await fetch("/api/settings");
   const data = await response.json();
-  claudeSettings = data.claude;
-  claudeKeyBtn.textContent = claudeSettings.configured ? "API Key 已设置" : "设置 API Key";
-  claudeKeyBtn.classList.toggle("is-missing", !claudeSettings.configured);
+  llmSettings = data.llm;
+  if (llmBusy) return;
+  promptHelperStatus.textContent = `${llmSettings.model} · 本地 · ${LLM_STATE_TEXT[llmSettings.state] || ""}`;
+  promptHelperStatus.title = llmSettings.detail || "";
 }
-
-function openClaudeKeyDialog() {
-  const s = claudeSettings || { configured: false };
-  const modal = document.createElement("div");
-  modal.className = "modal key-modal";
-  modal.innerHTML = `
-    <div class="modal-header">
-      <span>Claude API Key</span>
-      <button class="modal-x" type="button" data-act="close" title="关闭 (Esc)">${icon("x", 15)}</button>
-    </div>
-    <div class="modal-body">
-      <p class="key-desc">「中文优化」会调用 ${escapeHtml(s.model || "Claude Opus 5.5")}，把中文描述改写成适合当前模型的提示词。Key 只保存在本机项目的 .env 文件里，不会提交到 GitHub。</p>
-      <div class="key-status"><span class="dot ${s.configured ? "ok" : ""}"></span>${s.configured ? `已设置：${escapeHtml(s.key_hint)}` : "还没有设置"}</div>
-      <input class="input key-input" type="password" autocomplete="off" spellcheck="false" placeholder="${s.configured ? "粘贴新的 Key 替换" : "sk-ant-…"}" />
-      <a class="link-btn key-link" href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">在 Anthropic Console 创建 API Key ›</a>
-    </div>
-    <div class="modal-footer">
-      ${s.configured ? `<button class="btn btn-danger" type="button" data-act="delete">${icon("trash", 15)}删除 Key</button>` : ""}
-      <button class="btn" type="button" data-act="close">取消</button>
-      <button class="btn btn-primary" type="button" data-act="save">保存并校验</button>
-    </div>`;
-  const input = $(".key-input", modal);
-  const saveBtn = $('[data-act="save"]', modal);
-  const close = openModal(modal, {
-    onKey: (event) => {
-      if (event.key === "Enter" && document.activeElement === input) {
-        event.preventDefault();
-        save();
-      }
-    },
-  });
-  const save = async () => {
-    const key = input.value.trim();
-    if (!key) {
-      input.focus();
-      return;
-    }
-    saveBtn.disabled = true;
-    saveBtn.innerHTML = '<span class="spinner"></span>校验中…';
-    try {
-      const response = await fetch("/api/settings/claude", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ api_key: key }),
-      });
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(data.detail || "保存失败");
-      await refreshSettings();
-      toast("Key 有效，已保存", "success");
-      close();
-    } catch (error) {
-      toast(error.message || "保存失败", "error", 4000);
-      saveBtn.disabled = false;
-      saveBtn.textContent = "保存并校验";
-    }
-  };
-  modal.addEventListener("click", async (event) => {
-    const act = event.target.closest("[data-act]")?.dataset.act;
-    if (act === "close") close();
-    if (act === "save") save();
-    if (act === "delete") {
-      const ok = await confirmDialog({ title: "删除 Claude API Key？", message: "会从项目的 .env 里删掉这个 Key，之后「中文优化」需要重新填写。", okText: "删除" });
-      if (!ok) return;
-      await fetch("/api/settings/claude", { method: "DELETE" });
-      await refreshSettings();
-      toast("已删除 Key");
-      close();
-    }
-  });
-  setTimeout(() => input.focus(), 50);
-}
-
-claudeKeyBtn.addEventListener("click", () => openClaudeKeyDialog());
-
 /* ---------------- 生成 ---------------- */
 function setEngine(state, text) {
   engineDot.className = `dot ${state}`;
@@ -747,29 +851,36 @@ function setBusy(busy) {
   isBusy = busy;
   generateBtn.disabled = busy;
   generateBtn.innerHTML = busy ? '<span class="spinner"></span>生成中…' : "生成图片";
+  const multi = busy && !!batch && batch.count > 1;
+  stopBatchBtn.hidden = !multi;
+  stopBatchBtn.disabled = false;
+  stopBatchBtn.textContent = "这张完成后停止";
+  kbdHint.hidden = multi;
   stage.classList.toggle("is-busy", busy);
   clearInterval(busyTimer);
   if (busy) {
     const started = Date.now();
-    const needsLoad = engine.loadedModel !== currentModel();
+    const model = currentModel();
     lastProgress = null;
     busyBar.style.width = "0%";
     const tick = () => {
       const s = Math.floor((Date.now() - started) / 1000);
       const p = lastProgress;
+      const needsLoad = engine.loadedModel !== model;
+      const nth = batch && batch.count > 1 ? `第 ${batch.index} / ${batch.count} 张 · ` : "";
       if (p?.phase === "denoising" && p.total) {
-        busyText.textContent = `第 ${p.step} / ${p.total} 步 · ${s}s`;
+        busyText.textContent = `${nth}第 ${p.step} / ${p.total} 步 · ${s}s`;
         busyBar.style.width = `${(p.step / p.total) * 100}%`;
         $(".busy-sub", stage).hidden = true;
       } else if (p?.phase === "saving") {
-        busyText.textContent = `解码保存中 · ${s}s`;
+        busyText.textContent = `${nth}解码保存中 · ${s}s`;
         busyBar.style.width = "100%";
       } else {
-        busyText.textContent = `${needsLoad ? "加载模型中" : "准备中"} · ${s}s`;
+        busyText.textContent = `${nth}${needsLoad ? "加载模型中" : "准备中"} · ${s}s`;
       }
       setEngine("busy", `生成中 · ${s}s`);
     };
-    $(".busy-sub", stage).hidden = !needsLoad;
+    $(".busy-sub", stage).hidden = engine.loadedModel === model;
     tick();
     busyTimerTick = tick;
     busyTimer = setInterval(tick, 1000);
@@ -789,6 +900,7 @@ function renderResultMeta(params) {
     `${params.width} × ${params.height}`,
     `${params.steps} 步`,
     `CFG ${params.guidance_scale}`,
+    params.init_image ? `图生图 · 幅度 ${params.strength}` : null,
     `Seed ${params.seed}`,
     isNum(params.seconds) ? `${params.seconds.toFixed(1)}s` : null,
   ].filter(Boolean);
@@ -811,6 +923,7 @@ function showPreview(url, params) {
   downloadLink.setAttribute("download", name);
   downloadLink.classList.remove("is-disabled");
   useSeedBtn.disabled = false;
+  useRefBtn.disabled = false;
   renderResultMeta(params);
 }
 
@@ -820,52 +933,107 @@ function resetPreview(message = "写好提示词，点「生成图片」") {
   downloadLink.href = "#";
   downloadLink.classList.add("is-disabled");
   useSeedBtn.disabled = true;
+  useRefBtn.disabled = true;
   renderResultMeta(null);
+}
+
+async function requestGenerate(payload) {
+  const response = await fetch("/api/generate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const data = await response.json();
+  if (!response.ok) {
+    const detail = Array.isArray(data.detail) ? data.detail.map((d) => d.msg).join("；") : data.detail;
+    throw new Error(detail || "生成失败");
+  }
+  return data;
 }
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
   if (isBusy) return;
-  const payload = formPayload();
-  if (!payload.prompt) {
+  const base = formPayload();
+  if (!base.prompt) {
     toast("先写提示词", "error");
     promptInput.focus();
     return;
   }
-  const preset = models.find((m) => m.id === payload.model);
+  const preset = models.find((m) => m.id === base.model);
   if (preset?.downloadable && !preset.installed) {
     toast(`${preset.label} 还没下载，先点「下载模型」`, "error", 3500);
     return;
   }
+  const usedRef = refImage;
+  base.init_image = usedRef ? usedRef.src : "";
+  const count = readCount();
+  // 同一次生成的几张共用一个批次号，历史里折叠成一组
+  base.batch = count > 1 ? `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}` : "";
   saveForm();
+  stopRequested = false;
+  batch = { index: 1, count };
   setBusy(true);
+  let done = 0;
+  let totalSeconds = 0;
   try {
-    const response = await fetch("/api/generate", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    const data = await response.json();
-    if (!response.ok) {
-      const detail = Array.isArray(data.detail) ? data.detail.map((d) => d.msg).join("；") : data.detail;
-      throw new Error(detail || "生成失败");
+    // 多张是一张一张地生成：显存占用不变，每张有自己的 Seed，出一张显示一张
+    for (let i = 0; i < count && !stopRequested; i += 1) {
+      batch.index = i + 1;
+      lastProgress = null;
+      busyTimerTick?.();
+      const payload = { ...base, seed: base.seed == null ? null : (base.seed + i) % 2 ** 32 };
+      const data = await requestGenerate(payload);
+      done += 1;
+      totalSeconds += Number(data.seconds) || 0;
+      engine.loadedModel = payload.model;
+      if (data.init_image) {
+        // 参考图已存到服务器，后面几张不用重复上传
+        base.init_image = data.init_image;
+        if (usedRef && refImage === usedRef) {
+          refImage.src = data.init_image;
+          saveForm();
+        }
+      }
+      showPreview(data.url, { ...payload, init_image: data.init_image, seed: data.seed, seconds: data.seconds });
+      images = data.images || [];
+      renderGallery();
+      updateLastRun(data.gpu_metrics);
+      const saved = `已保存到 outputs/${data.url.split("/").pop()}`;
+      runInfo.textContent = count > 1 ? `第 ${done} / ${count} 张 · ${saved}` : saved;
     }
-    engine.loadedModel = payload.model;
-    showPreview(data.url, { ...payload, seed: data.seed, seconds: data.seconds });
-    images = data.images || [];
-    renderGallery();
-    updateLastRun(data.gpu_metrics);
-    runInfo.textContent = `已保存到 outputs/${data.url.split("/").pop()}`;
-    toast(`生成完成 · ${Number(data.seconds).toFixed(1)}s`, "success");
+    if (count > 1) toast(`${done < count ? "已停止 · " : ""}生成了 ${done} 张 · 共 ${totalSeconds.toFixed(1)}s`, "success", 3500);
+    else toast(`生成完成 · ${totalSeconds.toFixed(1)}s`, "success");
   } catch (error) {
-    currentResult = null;
-    preview.innerHTML = `<div class="empty err">${icon("alert", 30)}<p>${escapeHtml(error.message)}</p></div>`;
-    renderResultMeta(null);
-    runInfo.textContent = "生成失败。";
-    toast("生成失败", "error");
+    if (done) {
+      // 前面几张已经保存，保留最后一张的预览，只提示出错的这张
+      runInfo.textContent = `第 ${done + 1} 张生成失败：${error.message}`;
+      toast(`第 ${done + 1} 张生成失败，前 ${done} 张已保存`, "error", 4500);
+    } else {
+      currentResult = null;
+      preview.innerHTML = `<div class="empty err">${icon("alert", 30)}<p>${escapeHtml(error.message)}</p></div>`;
+      useSeedBtn.disabled = true;
+      useRefBtn.disabled = true;
+      renderResultMeta(null);
+      runInfo.textContent = "生成失败。";
+      toast("生成失败", "error");
+    }
   } finally {
+    batch = null;
     setBusy(false);
   }
+});
+
+stopBatchBtn.addEventListener("click", () => {
+  stopRequested = true;
+  stopBatchBtn.disabled = true;
+  stopBatchBtn.textContent = "这张完成后就停";
+});
+
+useRefBtn.addEventListener("click", () => {
+  if (!currentResult) return;
+  setRef(currentResult.url);
+  toast("已把这张图设为参考图");
 });
 
 document.addEventListener("keydown", (event) => {
@@ -897,15 +1065,8 @@ function formatTime(iso) {
   return `${d.getMonth() + 1}月${d.getDate()}日 ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
-function renderGallery() {
-  galleryCount.textContent = images.length ? `最近 ${images.length} 张 · 点击查看大图和参数` : "还没有图片";
-  if (!images.length) {
-    gallery.innerHTML = `<div class="empty">${icon("image", 30)}<p>生成的图片会出现在这里</p></div>`;
-    return;
-  }
-  gallery.innerHTML = images
-    .map(
-      (item, index) => `
+function thumbHtml({ item, index }) {
+  return `
       <article class="thumb">
         <div class="thumb-media" role="button" tabindex="0" data-index="${index}" title="${escapeHtml(item.prompt || item.name)}">
           <img src="${escapeHtml(item.url)}" alt="${escapeHtml(item.prompt || item.name)}" loading="lazy" />
@@ -918,31 +1079,163 @@ function renderGallery() {
           <div class="thumb-prompt">${escapeHtml(item.prompt || "无提示词")}</div>
           <div class="thumb-time">${escapeHtml(formatTime(item.created_at))}</div>
         </div>
-      </article>`,
-    )
-    .join("");
+      </article>`;
 }
 
-gallery.addEventListener("click", (event) => {
+// 同一次生成的几张叠成一摞（最上面是最新的那张，后面露出另外两张），点击像打开文件夹一样弹出
+function stackHtml(group) {
+  const n = group.items.length;
+  const key = escapeHtml(group.key);
+  const { item, index } = group.items[0];
+  const layer = (entry, cls) => (entry ? `<img class="stack-layer ${cls}" src="${escapeHtml(entry.item.url)}" alt="" loading="lazy" />` : "");
+  return `
+      <article class="thumb thumb-stack">
+        <div class="stack-wrap">
+          ${layer(group.items[2], "l2")}
+          ${layer(group.items[1], "l1")}
+          <div class="thumb-media" role="button" tabindex="0" data-group="${key}" title="同一次生成的 ${n} 张，点击打开">
+            <img src="${escapeHtml(item.url)}" alt="${escapeHtml(item.prompt || item.name)}" loading="lazy" />
+            <span class="stack-badge">${n} 张</span>
+            <div class="thumb-actions">
+              <button class="thumb-act" type="button" data-act="reuse" data-index="${index}" title="复用参数">${icon("reuse", 14)}</button>
+              <button class="thumb-act del" type="button" data-act="delete-group" data-group="${key}" title="删除这 ${n} 张">${icon("trash", 14)}</button>
+            </div>
+          </div>
+        </div>
+        <div class="thumb-meta">
+          <div class="thumb-prompt">${escapeHtml(item.prompt || "无提示词")}</div>
+          <div class="thumb-time">${escapeHtml(formatTime(item.created_at))}</div>
+        </div>
+      </article>`;
+}
+
+function renderGallery() {
+  galleryCount.textContent = images.length ? `最近 ${images.length} 张 · 点击查看大图和参数` : "还没有图片";
+  if (!images.length) {
+    gallery.innerHTML = `<div class="empty">${icon("image", 30)}<p>生成的图片会出现在这里</p></div>`;
+  } else {
+    gallery.innerHTML = galleryGroups()
+      .map((group) => (group.items.length < 2 ? thumbHtml(group.items[0]) : stackHtml(group)))
+      .join("");
+  }
+  folderRender?.();
+}
+
+let folderRender = null; // 分组弹窗打开时的重绘函数
+
+// 把相邻且批次相同的图片归成一组
+function galleryGroups() {
+  const groups = [];
+  images.forEach((item, index) => {
+    const last = groups[groups.length - 1];
+    if (item.group && last && last.key === item.group) last.items.push({ item, index });
+    else groups.push({ key: item.group || "", items: [{ item, index }] });
+  });
+  return groups;
+}
+
+// 图片缩略图上的点击：操作按钮、打开分组、看大图（历史区和分组弹窗共用）
+function handleThumbClick(event, { afterReuse } = {}) {
   const act = event.target.closest("[data-act]");
   if (act) {
-    event.stopPropagation();
+    if (act.dataset.act === "delete-group") {
+      deleteGroup(act.dataset.group);
+      return true;
+    }
     const item = images[Number(act.dataset.index)];
-    if (!item) return;
+    if (!item) return false;
     if (act.dataset.act === "delete") deleteImage(item.name);
-    if (act.dataset.act === "reuse") reuseParams(item.name);
-    return;
+    else if (act.dataset.act === "reuse") reuseParams(item.name).then((ok) => ok && afterReuse?.());
+    else return false;
+    return true;
   }
   const media = event.target.closest(".thumb-media");
-  if (media) openLightbox(Number(media.dataset.index));
-});
+  if (!media) return false;
+  if (media.dataset.group) openFolder(media.dataset.group);
+  else openLightbox(Number(media.dataset.index));
+  return true;
+}
+
+gallery.addEventListener("click", (event) => handleThumbClick(event));
 gallery.addEventListener("keydown", (event) => {
   const media = event.target.closest(".thumb-media");
   if (media && (event.key === "Enter" || event.key === " ") && event.target === media) {
     event.preventDefault();
-    openLightbox(Number(media.dataset.index));
+    if (media.dataset.group) openFolder(media.dataset.group);
+    else openLightbox(Number(media.dataset.index));
   }
 });
+
+function openFolder(key) {
+  const modal = document.createElement("div");
+  modal.className = "modal folder";
+  modal.innerHTML = `
+    <div class="modal-header">
+      <span class="folder-title"></span>
+      <button class="modal-x" type="button" data-act="close" title="关闭 (Esc)">${icon("x", 15)}</button>
+    </div>
+    <div class="folder-prompt"></div>
+    <div class="folder-body"><div class="group-grid"></div></div>
+    <div class="modal-footer">
+      <button class="btn btn-danger" type="button" data-act="delete-group" data-group="${escapeHtml(key)}">${icon("trash", 15)}删除这组</button>
+      <button class="btn" type="button" data-act="close">关闭</button>
+    </div>`;
+  const render = () => {
+    const items = images.map((item, index) => ({ item, index })).filter((entry) => entry.item.group === key);
+    if (!items.length) {
+      close();
+      return;
+    }
+    $(".folder-title", modal).textContent = `同一次生成 · ${items.length} 张`;
+    $(".folder-prompt", modal).textContent = items[0].item.prompt || "无提示词";
+    $(".group-grid", modal).innerHTML = items.map(thumbHtml).join("");
+  };
+  const closeModal = openModal(modal);
+  const close = () => {
+    if (folderRender === render) folderRender = null;
+    closeModal();
+  };
+  // Esc 或点遮罩关闭时也要注销重绘函数
+  new MutationObserver((_, observer) => {
+    if (!modal.isConnected) {
+      if (folderRender === render) folderRender = null;
+      observer.disconnect();
+    }
+  }).observe(document.body, { childList: true });
+  modal.addEventListener("click", (event) => {
+    if (event.target.closest('[data-act="close"]')) close();
+    else handleThumbClick(event, { afterReuse: close });
+  });
+  folderRender = render;
+  render();
+}
+
+async function deleteGroup(key) {
+  const names = images.filter((item) => item.group === key).map((item) => item.name);
+  if (!names.length) return;
+  const ok = await confirmDialog({
+    title: `删除这 ${names.length} 张图片？`,
+    message: "同一次生成的这几张图片和它们的参数记录会从 outputs 目录删除，无法恢复。",
+  });
+  if (!ok) return;
+  let removed = 0;
+  try {
+    for (const name of names) {
+      const response = await fetch(`/api/images/${encodeURIComponent(name)}`, { method: "DELETE" });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || "删除失败");
+      removed += 1;
+      images = data.images || [];
+      metaCache.delete(name);
+      if (currentResult?.name === name) resetPreview("当前图片已删除");
+    }
+    toast(`已删除 ${removed} 张`, "success");
+  } catch (error) {
+    toast(`${error.message || "删除失败"}${removed ? `，已删除 ${removed} 张` : ""}`, "error", 3500);
+  } finally {
+    renderGallery();
+  }
+}
 
 async function loadMeta(name) {
   if (metaCache.has(name)) return metaCache.get(name);
@@ -1084,6 +1377,7 @@ function openLightbox(startIndex) {
     <div class="modal-footer">
       <button class="btn btn-danger" type="button" data-act="delete">${icon("trash", 15)}删除</button>
       <a class="btn" data-act="download" download>${icon("download", 15)}下载</a>
+      <button class="btn" type="button" data-act="ref">${icon("image", 15)}作为参考图</button>
       <button class="btn btn-primary" type="button" data-act="reuse">${icon("reuse", 15)}复用参数</button>
     </div>`;
   const img = $("img", modal);
@@ -1117,6 +1411,7 @@ function openLightbox(startIndex) {
           <dt>LoRA</dt><dd>${meta.lora_path ? `${escapeHtml(meta.lora_path.split("/").pop())} × ${escapeHtml(meta.lora_scale)}` : "无"}</dd>
           <dt>尺寸</dt><dd>${escapeHtml(meta.width)} × ${escapeHtml(meta.height)}</dd>
           <dt>步数</dt><dd>${escapeHtml(meta.steps)} 步 · CFG ${escapeHtml(meta.guidance_scale)}</dd>
+          ${meta.init_image ? `<dt>图生图</dt><dd>重绘幅度 ${escapeHtml(meta.strength)}</dd>` : ""}
           <dt>Seed</dt><dd>${escapeHtml(meta.seed)}</dd>
           <dt>耗时</dt><dd>${isNum(meta.seconds) ? `${meta.seconds.toFixed(1)}s` : "--"}</dd>
           <dt>时间</dt><dd>${escapeHtml(formatTime(item.created_at))}</dd>
@@ -1149,6 +1444,11 @@ function openLightbox(startIndex) {
     if (act === "prev") move(-1);
     if (act === "next") move(1);
     if (act === "reuse" && (await reuseParams(images[index].name))) close();
+    if (act === "ref") {
+      setRef(images[index].url);
+      toast("已把这张图设为参考图");
+      close();
+    }
     if (act === "delete") {
       const name = images[index].name;
       if (await deleteImage(name)) {
@@ -1213,6 +1513,7 @@ function updateGpuPanel(data) {
 
 /* ---------------- 数据刷新 ---------------- */
 async function refreshStatus() {
+  refreshSettings().catch(() => {}); // 本地 LLM 的状态跟着一起刷新（出图后它会被换下显存）
   try {
     const response = await fetch("/api/status");
     const data = await response.json();
