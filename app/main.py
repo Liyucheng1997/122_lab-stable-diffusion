@@ -175,6 +175,8 @@ def _gpu_snapshot() -> dict[str, Any]:
             text=True,
             stderr=subprocess.DEVNULL,
             timeout=3,
+            # 桌面版用 pythonw 启动、没有控制台，不加这个每次轮询都会弹出一个黑窗口
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         ).strip()
     except (OSError, subprocess.SubprocessError):
         return {

@@ -34,3 +34,6 @@ loras/.previews/
 Thumbs.db
 .vscode/
 .idea/
+
+# Desktop window (pywebview) browser storage
+.webview/
