@@ -570,8 +570,8 @@ function formPayload() {
     seed: readNumber(seedInput),
     strength: readStrength(),
     pose: pose?.id || "",
-    pose_mode: poseMode(),
     pose_scale: readPoseScale(),
+    pose_controlnet: POSE_CONTROLNET,
   };
 }
 
@@ -611,8 +611,8 @@ function applyParams(params, { includeSeed = true } = {}) {
   if (includeSeed) seedInput.value = isNum(params.seed) ? params.seed : "";
   if (isNum(params.strength)) setPair(strengthInput, strengthRange, params.strength);
   if (isNum(params.count)) setPair(countInput, countRange, params.count);
-  if (params.pose_mode) setPoseMode(params.pose_mode);
-  if (isNum(params.pose_scale)) setPair(poseScaleInput, poseScaleRange, params.pose_scale);
+  // 强度只在同一个 ControlNet 下沿用：之前完整版用的 0.7 放到 Lite 版上基本不跟姿势，改回默认
+  setPair(poseScaleInput, poseScaleRange, isNum(params.pose_scale) && params.pose_controlnet === POSE_CONTROLNET ? params.pose_scale : POSE_DEFAULT_SCALE);
   setRef(params.init_image || null);
   // 没记 pose 的（旧图片、旧表单）都是没用姿势出的图
   setPose(params.init_image ? null : params.pose || null, { quiet: true });
@@ -807,10 +807,8 @@ const poseName = $("#poseName");
 const poseMeta = $("#poseMeta");
 const poseTag = $("#poseTag");
 const poseControls = $("#poseControls");
-const poseModeSeg = $("#poseModeSeg");
 const poseScaleInput = $("#poseScale");
 const poseScaleRange = $("#poseScaleRange");
-const poseNote = $("#poseNote");
 const poseHint = $("#poseHint");
 const cnDownload = $("#cnDownload");
 const cnDlText = $("#cnDlText");
@@ -822,26 +820,18 @@ const composerPose = $("#composerPose");
 const composerPoseText = $("#composerPoseText");
 const POSE_ANGLES = ["正面", "斜侧", "侧面", "俯视", "仰视"];
 const POSE_FILTER_KEY = "aigen.pose.filter";
-// 实测（同一提示词、同一 seed）：轮廓 0.7 动作对、衣服自然；0.45 基本不跟姿势；0.8 起衣服会贴着身体轮廓
-const POSE_NOTES = {
-  outline: "只按人物外轮廓摆动作，衣服、脸、背景照提示词画。0.7 左右最自然；低于 0.6 动作会走样，高于 0.8 衣服会贴着身体轮廓。",
-  line: "按白模线稿摆动作，手脚位置更准，但白模的关节圆圈和分割线容易画成紧身衣。建议 0.6～0.7。",
-};
+// 用的是 Lite 版 ControlNet（和 app/poses.py 一致）。实测（同一提示词、同一 seed）：
+// 0.7 基本不跟姿势；0.8～0.9 动作准、衣服自然；1.0 衣服贴着身体轮廓
+const POSE_CONTROLNET = "zimage-controlnet-union-lite";
+const POSE_DEFAULT_SCALE = 0.85;
 let posePollTimer = null;
 let poseLibRender = null; // 姿势库弹窗打开时的重绘函数
 
 const poseThumbUrl = (id) => `/poses/thumbs/${encodeURIComponent(id)}.jpg`;
 
-function poseMode() {
-  return $("button.active", poseModeSeg)?.dataset.mode || "outline";
-}
-function setPoseMode(mode) {
-  for (const btn of $$("button", poseModeSeg)) btn.classList.toggle("active", btn.dataset.mode === (mode === "line" ? "line" : "outline"));
-  poseNote.textContent = POSE_NOTES[poseMode()];
-}
 function readPoseScale() {
   const value = Number(poseScaleInput.value);
-  return Number.isFinite(value) && value > 0 ? Math.max(0.3, Math.min(1.2, value)) : 0.7;
+  return Number.isFinite(value) && value > 0 ? Math.max(0.3, Math.min(1.2, value)) : POSE_DEFAULT_SCALE;
 }
 
 // id → 姿势库里的完整条目（姿势库还没读到时先只记 id，读到后再补全）
@@ -871,7 +861,6 @@ function renderPose() {
   } else {
     poseThumb.removeAttribute("src");
   }
-  poseNote.textContent = POSE_NOTES[poseMode()];
   const family = familyOf(currentModel());
   const wrongModel = on && family !== "zimage";
   poseHint.hidden = !wrongModel;
@@ -1007,7 +996,7 @@ function openPoseLibrary() {
         const pct = job.total ? Math.floor((job.done / job.total) * 100) : 0;
         html += `<div class="dl-box"><div class="dl-head"><span class="dl-text">正在下载姿势库 ${pct}%</span></div><div class="meter"><span style="width:${pct}%"></span></div><span class="field-note">${job.done} / ${job.total || "--"} 个文件</span></div>`;
       } else {
-        html += `<div class="dl-box"><div class="dl-head"><span class="dl-text">${job?.status === "error" ? "下载没完成" : "姿势库还没下载"}</span><button class="btn btn-primary btn-sm" type="button" data-act="dl-poses">${job?.status === "error" ? "接着下载" : "下载姿势库（约 700 MB）"}</button></div><span class="field-note">${escapeHtml(job?.error || "")} 来自 ai-pose-gallery（原作者ギア @giaaibusi），1439 张多角度白模姿势，下载到项目的 poses 目录，只供个人学习创作。</span></div>`;
+        html += `<div class="dl-box"><div class="dl-head"><span class="dl-text">${job?.status === "error" ? "下载没完成" : "姿势库还没下载"}</span><button class="btn btn-primary btn-sm" type="button" data-act="dl-poses">${job?.status === "error" ? "接着下载" : "下载姿势库（约 55 MB）"}</button></div><span class="field-note">${escapeHtml(job?.error || "")} 来自 ai-pose-gallery（原作者ギア @giaaibusi），1439 张多角度白模姿势，下载到项目的 poses 目录，只供个人学习创作。</span></div>`;
       }
     }
     const cn = lib.controlnet;
@@ -1139,14 +1128,6 @@ cnDlBtn.addEventListener("click", async () => {
   cnDlBtn.disabled = true;
   await downloadControlnet();
   cnDlBtn.disabled = false;
-});
-poseModeSeg.addEventListener("click", (event) => {
-  const btn = event.target.closest("button[data-mode]");
-  if (!btn) return;
-  setPoseMode(btn.dataset.mode);
-  // 两种方式合适的强度不一样：线稿超过 0.7 就容易出紧身衣
-  if (btn.dataset.mode === "line" && readPoseScale() > 0.7) setPair(poseScaleInput, poseScaleRange, 0.65);
-  saveForm();
 });
 bindPair(poseScaleInput, poseScaleRange);
 
@@ -1805,7 +1786,7 @@ function renderResultMeta(params) {
     `${params.steps} 步`,
     `CFG ${params.guidance_scale}`,
     params.init_image ? `图生图 · 幅度 ${params.strength}` : null,
-    params.pose ? `姿势 ${poseLabel(resolvePose(params.pose))} · ${params.pose_mode === "line" ? "线稿" : "轮廓"} ${params.pose_scale}` : null,
+    params.pose ? `姿势 ${poseLabel(resolvePose(params.pose))} · 强度 ${params.pose_scale}` : null,
     `Seed ${params.seed}`,
     isNum(params.seconds) ? `${params.seconds.toFixed(1)}s` : null,
   ].filter(Boolean);

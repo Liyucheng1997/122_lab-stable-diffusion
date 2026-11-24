@@ -5,9 +5,9 @@
 第一次用时在网页上点「下载姿势库」或运行 scripts/download_poses.py。
 
     poses/poses.json         姿势列表（中文元数据）
-    poses/thumbs/<id>.jpg    缩略图 300 × 400
-    poses/img/<id>.png       白模线稿 900 × 1200
-    poses/depth/<id>.webp    深度图 900 × 1200
+    poses/thumbs/<id>.jpg    缩略图 300 × 400（姿势库里看的）
+    poses/depth/<id>.webp    深度图 900 × 1200（出图时从它提取轮廓当控制图）
+    poses/img/<id>.png       白模线稿原图 900 × 1200（可选，出图用不到，下载时加 --full）
 """
 
 from __future__ import annotations
@@ -33,24 +33,45 @@ REF = "ec7a81e11fd599406ad60796be70ac693e5b6340"  # 固定到核对过的版本
 SYSTEMS = ["全身单人・标准系", "全身单人・性感系", "上半身单人", "双人缠绵"]
 ANGLES = ["正面", "斜侧", "侧面", "俯视", "仰视"]
 
-# 出图时拿什么当控制图（实测见 README）：
-#   outline 轮廓：从深度图提取的人物外轮廓和四肢交叠处的边，没有白模的关节圆圈、分割线，衣服和脸都不受影响
-#   line    线稿：白模原图的线稿，动作更准，但关节圆圈和身体分割线容易变成紧身衣上的花纹
-# 深度图本身不直接用：强度够让人物摆出姿势时，画出来的就是一个没脸的白模
-CONTROL_MODES = {"outline": "轮廓", "line": "线稿"}
+# 控制图用「轮廓」：从深度图提取的人物外轮廓和四肢交叠处的边，衣服、脸、背景照提示词画。实测排除了：
+#   深度图直接用：强度够让人物摆出姿势时，画出来就是一个没脸的白模
+#   白模线稿：关节圆圈和身体分割线会画成白色紧身衣
+# 强度（Lite 版，同一提示词同一 seed）：0.7 基本不跟姿势；0.8～0.9 动作准、衣服自然；1.0 衣服贴着身体轮廓
+DEFAULT_SCALE = 0.85
 
-# ControlNet：Z-Image Turbo 官方的 Union 控制网（Canny / Depth / Pose / HED / Scribble…），8 步蒸馏版
+# ControlNet：Z-Image Turbo 官方 Union 控制网的 Lite 版（2602，8 步蒸馏）：3 个控制层，约 1B 参数，bf16 直接放显卡。
+# 不用完整版（15 个控制层，3.3B）：16GB 显卡上它要 fp8 存权重，每层算时临时转回 bf16，显存反复申请释放，
+# 实占比实用多 4～5GB，峰值 14.8GB，会爆显存，也拖累内存；Lite 版峰值 9.7GB，每张还快 30%（实测）。
 CONTROLNET = {
-    "id": "zimage-controlnet-union",
-    "label": "Z-Image Turbo ControlNet Union 2.1",
+    "id": "zimage-controlnet-union-lite",
+    "label": "Z-Image Turbo ControlNet Union 2.1 Lite",
     "repo": "alibaba-pai/Z-Image-Turbo-Fun-Controlnet-Union-2.1",
-    "file": "Z-Image-Turbo-Fun-Controlnet-Union-2.1-2602-8steps.safetensors",
-    "size_gb": 6.71,
+    "file": "Z-Image-Turbo-Fun-Controlnet-Union-2.1-lite-2602-8steps.safetensors",
+    "folder": "Z-Image-Turbo-ControlNet-Union-2.1-lite-2602",
+    "size_gb": 2.02,
     "license": "Apache-2.0",
+    "control_layers_places": [0, 10, 20],  # 挂在 transformer 的第几层，照官方 z_image_control_2.1_lite.yaml
 }
 CONTROLNET_PATH = ROOT_DIR / "models" / "controlnet" / CONTROLNET["file"]
-# 下载的是 fp32 单文件（6.7GB）；第一次加载时转成 bf16 的 diffusers 目录（3.4GB，之后秒开、不用联网），再删掉单文件
-CONTROLNET_DIR = ROOT_DIR / "models" / "controlnet" / "Z-Image-Turbo-ControlNet-Union-2.1-2602"
+# 下载的是单文件；下载完转成 diffusers 目录（之后直接按目录加载，内存映射），再删掉单文件
+CONTROLNET_DIR = ROOT_DIR / "models" / "controlnet" / CONTROLNET["folder"]
+
+# 配置照官方 VideoX-Fun 的 config/z_image/z_image_control_2.1*.yaml 写，不让 diffusers 按权重去猜：
+# Lite 版它猜不对（会当成 1.0 版），而且猜的时候还要联网下载配置
+CONTROLNET_CONFIG = {
+    "_class_name": "ZImageControlNetModel",
+    "add_control_noise_refiner": "control_noise_refiner",
+    "all_f_patch_size": [1],
+    "all_patch_size": [2],
+    "control_in_dim": 33,
+    "control_refiner_layers_places": [0, 1],
+    "dim": 3840,
+    "n_heads": 30,
+    "n_kv_heads": 30,
+    "n_refiner_layers": 2,
+    "norm_eps": 1e-05,
+    "qk_norm": True,
+}
 
 
 def controlnet_converted() -> bool:
@@ -61,26 +82,32 @@ def controlnet_installed() -> bool:
     return controlnet_converted() or CONTROLNET_PATH.is_file()
 
 
-def convert_controlnet() -> None:
-    """fp32 单文件 → bf16 diffusers 目录，成功后删掉单文件。第一次要联网读一个很小的配置文件。
+def convert_controlnet(source: Path | None = None, target: Path | None = None, places: list[int] | None = None) -> None:
+    """单文件 → bf16 diffusers 目录，成功后删掉单文件。不用联网。
 
-    峰值内存约 10GB，所以下载完就在单独的进程里做（见 main.py），不等到 Z-Image 已经占着 20GB 内存时再做。
+    完整版峰值内存约 10GB，所以下载完就在单独的进程里做（见 main.py），不等到 Z-Image 已经占着 20GB 内存时再做。
     """
-    if controlnet_converted():
+    source = source or CONTROLNET_PATH
+    target = target or CONTROLNET_DIR
+    places = places or CONTROLNET["control_layers_places"]
+    if (target / "config.json").is_file() and any(target.glob("*.safetensors")):
         return
     import shutil
+    import tempfile
 
     import torch
     from diffusers import ZImageControlNetModel
 
-    tmp = CONTROLNET_DIR.with_name(CONTROLNET_DIR.name + ".part")
+    tmp = target.with_name(target.name + ".part")
     shutil.rmtree(tmp, ignore_errors=True)
-    model = ZImageControlNetModel.from_single_file(str(CONTROLNET_PATH), torch_dtype=torch.bfloat16)
+    with tempfile.TemporaryDirectory() as config_dir:
+        Path(config_dir, "config.json").write_text(json.dumps({**CONTROLNET_CONFIG, "control_layers_places": places}), encoding="utf-8")
+        model = ZImageControlNetModel.from_single_file(str(source), config=config_dir, torch_dtype=torch.bfloat16)
     model.save_pretrained(str(tmp))
     del model
-    shutil.rmtree(CONTROLNET_DIR, ignore_errors=True)
-    tmp.rename(CONTROLNET_DIR)
-    CONTROLNET_PATH.unlink(missing_ok=True)
+    shutil.rmtree(target, ignore_errors=True)
+    tmp.rename(target)
+    source.unlink(missing_ok=True)
 
 
 def raw_url(path: str) -> str:
@@ -136,7 +163,7 @@ def describe(pose: dict[str, Any]) -> str:
 
 
 def file_path(pose_id: str, kind: str) -> Path:
-    if kind == "line":
+    if kind == "full":
         return POSE_DIR / "img" / f"{pose_id}.png"
     if kind == "depth":
         return POSE_DIR / "depth" / f"{pose_id}.webp"
@@ -145,15 +172,13 @@ def file_path(pose_id: str, kind: str) -> Path:
 
 def library() -> dict[str, Any]:
     items, _ = _load()
-    have_line = (POSE_DIR / "img").is_dir()
     return {
         "installed": bool(items) and (POSE_DIR / "depth").is_dir(),
         "count": len(items),
         "items": items,
-        "has_line": have_line,
         "systems": [s for s in SYSTEMS if any(p["system"] == s for p in items)],
         "angles": ANGLES,
-        "modes": CONTROL_MODES,
+        "default_scale": DEFAULT_SCALE,
         "source": "https://ai-pose-gallery.anhao.app/poses",
         "job": downloader.snapshot(),
         "controlnet": {
@@ -187,8 +212,11 @@ def _fetch(client: httpx.Client, path: str, target: Path) -> str | None:
     return error
 
 
-def download_all(full: bool = True, workers: int = 16, on_progress: Any = None) -> tuple[int, list[str]]:
-    """下载姿势列表、缩略图、深度图，full=True 时连同白模线稿。已有的文件跳过。返回 (文件数, 失败列表)。"""
+def download_all(full: bool = False, workers: int = 16, on_progress: Any = None) -> tuple[int, list[str]]:
+    """下载姿势列表、缩略图、深度图（约 55MB），full=True 时连同白模线稿原图（约 640MB）。已有的文件跳过。
+
+    返回 (文件数, 失败列表)。
+    """
     POSE_DIR.mkdir(exist_ok=True)
     with httpx.Client(timeout=60, follow_redirects=True) as client:
         response = client.get(raw_url("data/pose-zh.json"))
@@ -200,7 +228,7 @@ def download_all(full: bool = True, workers: int = 16, on_progress: Any = None) 
             tasks.append((f"thumbs/{pid}.jpg", file_path(pid, "thumb")))
             tasks.append((f"img/depth/{pid}.webp", file_path(pid, "depth")))
             if full:
-                tasks.append((f"img/{pid}.png", file_path(pid, "line")))
+                tasks.append((f"img/{pid}.png", file_path(pid, "full")))
         errors: list[str] = []
         done = 0
         with ThreadPoolExecutor(workers) as pool:
@@ -261,20 +289,14 @@ downloader = PoseDownloader()
 # ---------------------------------------------------------------------------
 
 
-def control_image(pose_id: str, mode: str, width: int, height: int) -> Any:
-    """按出图尺寸准备控制图：黑底白线（和 ControlNet 训练用的 HED / Scribble 一致）。
+def control_image(pose_id: str, width: int, height: int) -> Any:
+    """按出图尺寸准备控制图：人物轮廓，黑底白线（和 ControlNet 训练用的 HED / Scribble 一致）。
 
     整个人物都保留，不裁切：比例和姿势图（3:4）不一样时，在两侧或上下补黑边。
     """
-    from PIL import Image, ImageOps
+    from PIL import Image
 
-    if mode == "outline":
-        image = outline_image(pose_id)
-    elif mode == "line":
-        with Image.open(file_path(pose_id, "line")) as source:
-            image = ImageOps.invert(source.convert("RGB"))
-    else:
-        raise ValueError(f"不支持的控制方式：{mode}")
+    image = outline_image(pose_id)
     scale = min(width / image.width, height / image.height)
     resized = image.resize((max(1, round(image.width * scale)), max(1, round(image.height * scale))), Image.Resampling.LANCZOS)
     if resized.size == (width, height):

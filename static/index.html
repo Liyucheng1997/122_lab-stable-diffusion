@@ -12,7 +12,7 @@
       } catch (e) {}
     </script>
     <link rel="stylesheet" href="/static/tokens.css?v=13" />
-    <link rel="stylesheet" href="/static/styles.css?v=26" />
+    <link rel="stylesheet" href="/static/styles.css?v=27" />
   </head>
   <body>
     <div id="app">
@@ -217,22 +217,13 @@
                       </div>
                     </div>
                   </div>
-                  <div id="poseControls" class="stack" hidden>
-                    <div class="field">
-                      <span class="field-label">控制方式</span>
-                      <div class="seg seg-block" id="poseModeSeg">
-                        <button type="button" data-mode="outline" class="active">轮廓</button>
-                        <button type="button" data-mode="line">线稿</button>
-                      </div>
+                  <div id="poseControls" class="field" hidden>
+                    <span class="field-label">姿势强度</span>
+                    <div class="slider-row">
+                      <input id="poseScaleRange" type="range" min="0.6" max="1.1" step="0.05" value="0.85" />
+                      <input id="poseScale" class="input num" type="number" min="0.3" max="1.2" step="0.05" value="0.85" />
                     </div>
-                    <div class="field">
-                      <span class="field-label">姿势强度</span>
-                      <div class="slider-row">
-                        <input id="poseScaleRange" type="range" min="0.5" max="1" step="0.05" value="0.7" />
-                        <input id="poseScale" class="input num" type="number" min="0.3" max="1.2" step="0.05" value="0.7" />
-                      </div>
-                      <span id="poseNote" class="field-note"></span>
-                    </div>
+                    <span class="field-note">按人物轮廓摆动作，衣服、脸、背景照提示词画。0.85 左右最自然；低于 0.75 动作容易走样，高于 0.95 衣服会贴着身体轮廓。</span>
                   </div>
                   <div id="cnDownload" class="dl-box" hidden>
                     <div class="dl-head">
@@ -394,6 +385,6 @@
       </div>
     </div>
     <div id="toastHost" class="toast-host"></div>
-    <script src="/static/app.js?v=28"></script>
+    <script src="/static/app.js?v=29"></script>
   </body>
 </html>

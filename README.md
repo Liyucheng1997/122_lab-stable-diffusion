@@ -85,21 +85,21 @@ powershell -ExecutionPolicy Bypass -File .\create_shortcut.ps1
 - 入口：参数面板的「参考姿势」，或 AI 助手输入框下面的「姿势」。弹出的姿势库按体系（全身标准 / 全身性感 / 上半身 / 双人）、分类、视角（正面 / 斜侧 / 侧面 / 俯视 / 仰视）筛选，也能搜动作名；每张卡片下面切视角，点图选用
 - 选了姿势后画面比例自动切到 3:4（姿势图都是 900 × 1200 竖图），助手也会照着姿势写人物动作和视角
 - 参考姿势和图生图二选一，后放的为准
-- 生成的图的 `.json` 里会记下用的姿势（`pose`、`pose_name`、`pose_mode`、`pose_scale`），「复用参数」会一起带回来
+- 生成的图的 `.json` 里会记下用的姿势（`pose`、`pose_name`、`pose_scale`、`pose_controlnet`），「复用参数」会一起带回来
 
-**控制方式和强度**（同一提示词、同一 seed 实测）：
+**控制图和强度**（同一提示词、同一 seed 实测）：控制图是从姿势的深度图里提取的人物轮廓（黑底白线），只管动作和身形，衣服、脸、背景都照提示词画。默认强度 0.85：
 
-| 控制图 | 效果 |
+| 强度 | 效果 |
 | --- | --- |
-| 轮廓（默认）· 0.7 | 从深度图提取的人物外轮廓，没有白模的关节圆圈和分割线。动作准、衣服自然，推荐 |
-| 轮廓 · 0.8 以上 | 动作更贴，但衣服会贴着身体轮廓（例如长袖衬衫变成短上衣） |
-| 0.6 以下 | 动作明显走样；0.45 基本不跟姿势 |
-| 线稿 · 0.6–0.7 | 白模原图线稿，手脚位置更准，但关节圆圈和分割线容易画成白色紧身衣 |
-| 深度图（没有采用） | 强度够摆出姿势时，画出来的就是一个没脸的白模 |
+| 0.7 | 基本不跟姿势 |
+| 0.8–0.9（默认 0.85） | 动作准（手的位置、腿的角度、身体朝向都对），衣服自然，推荐 |
+| 1.0 | 动作更贴，但衣服会贴着身体轮廓（长袖衬衫变成短背心） |
+
+试过没采用的：直接用深度图，强度够摆出姿势时画出来就是一个没脸的白模；用白模线稿，关节圆圈和身体分割线会画成白色紧身衣。
 
 **需要下载两样东西**（第一次选姿势时网页上会提示，点一下就行）：
 
-1. 姿势库（约 700 MB → `poses/`）：来自 [ai-pose-gallery](https://ai-pose-gallery.anhao.app/poses) / GitHub [anhao/ai-pose-gallery-zh](https://github.com/anhao/ai-pose-gallery-zh)，原作者ギア（[@giaaibusi](https://x.com/giaaibusi)）。图片版权归原作者，只供个人学习和创作，所以 `poses/` 不进 git。也可以用命令下载（中断了重跑会接着下）：
+1. 姿势库（约 55 MB → `poses/`）：缩略图和深度图，来自 [ai-pose-gallery](https://ai-pose-gallery.anhao.app/poses) / GitHub [anhao/ai-pose-gallery-zh](https://github.com/anhao/ai-pose-gallery-zh)，原作者ギア（[@giaaibusi](https://x.com/giaaibusi)）。图片版权归原作者，只供个人学习和创作，所以 `poses/` 不进 git。也可以用命令下载（中断了重跑会接着下；加 `--full` 另外下载约 640 MB 的白模线稿原图，出图用不到）：
 
    ```powershell
    .\.venv\Scripts\python scripts\download_poses.py
@@ -107,9 +107,19 @@ powershell -ExecutionPolicy Bypass -File .\create_shortcut.ps1
 
    连不上 GitHub 时在 `.env` 里设 `POSE_MIRROR`（raw.githubusercontent.com 的镜像地址）。
 
-2. 姿势控制模型（6.7 GB → `models/controlnet/`）：阿里 PAI 的 [Z-Image-Turbo-Fun-Controlnet-Union-2.1](https://huggingface.co/alibaba-pai/Z-Image-Turbo-Fun-Controlnet-Union-2.1)（`2602-8steps` 版，Apache-2.0），8 步蒸馏，和 Z-Image Turbo 一样 9 步出图。下载完会在单独的进程里转成 diffusers 目录（第一次要联网读一个很小的配置文件）。
+2. 姿势控制模型（2 GB → `models/controlnet/`）：阿里 PAI 的 [Z-Image-Turbo-Fun-Controlnet-Union-2.1](https://huggingface.co/alibaba-pai/Z-Image-Turbo-Fun-Controlnet-Union-2.1) 的 Lite 版（`lite-2602-8steps`，Apache-2.0）：3 个控制层、约 1B 参数，8 步蒸馏，和 Z-Image Turbo 一样 9 步出图。下载完会在单独的进程里转成 diffusers 目录，不用联网。
 
-显存和速度（RTX 5080 Laptop 16GB，896 × 1152）：ControlNet 和 Z-Image 一样用 fp8 存权重，出图峰值约 12 GB；它平时放在内存里，出图时才搬上显卡，不和本地 LLM 抢显存。第一张要加载 ControlNet，约 80 秒；之后每张约 25–30 秒。
+**显存和内存**（RTX 5080 Laptop 16GB、32GB 内存，896 × 1152，连出 3 张）：
+
+| | 完整版 ControlNet（v2.1.0） | Lite 版（现在） |
+| --- | --- | --- |
+| 显存实占峰值 | 14.8 GB，会爆显存 | 9.7 GB |
+| 出图进程提交内存 | 31–36 GB | 26 GB |
+| 每张耗时（第二张起） | 27–37 秒 | 19–23 秒 |
+
+完整版有 15 个控制层（3.3B 参数），16GB 显卡上只能用 fp8 存权重，每层算的时候临时转回 bf16，显存反复申请释放，实际占住的比用到的多 4～5 GB；显存不够时 Windows 会把多出的部分挪到系统内存，进程提交内存冲到 40 GB 以上。Lite 版 2 GB 直接用 bf16，没有这个问题。
+
+ControlNet 平时放在内存里，去噪第一步（文本编码器下了显卡之后）才搬上显卡，去噪完就搬回内存，不和文本编码器、VAE 解码和本地 LLM 抢显存。万一还是爆了显存，出图进程会自动重启，再点一次「生成图片」就行，不用重开软件。
 
 ## 模型
 

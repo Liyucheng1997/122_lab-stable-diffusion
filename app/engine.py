@@ -41,6 +41,8 @@ class LoadedPipeline:
     memory_mode: str | None = None
     img2img: Any | None = None  # 图生图管线，和 pipe 共用同一套权重，第一次用到时才建
     controlnet_pipe: Any | None = None  # 姿势控制（Z-Image ControlNet）管线，同样共用权重，第一次选姿势出图时才加载
+    controlnet_on_gpu: bool = False
+    controlnet_own: list[Any] = []  # ControlNet 自己的层（不含借用的 transformer 层），上下显卡只搬这些
     on_gpu: bool = False  # 整个模型常驻显存（SD 1.5 / SDXL）；Z-Image 靠 offload，空闲时本来就在内存里
     parked: bool = False  # 已经把显存让给本地 LLM，下次出图前要搬回显卡
 
@@ -340,10 +342,10 @@ def _img2img_pipeline(pipe: Any, model_key: str) -> Any:
 
 
 def _controlnet_pipeline(pipe: Any, model_key: str, torch: Any) -> Any:
-    """姿势控制管线：Z-Image + ControlNet Union，和文生图共用 transformer / VAE / 文本编码器。
+    """姿势控制管线：Z-Image + ControlNet Union Lite，和文生图共用 transformer / VAE / 文本编码器。
 
-    ControlNet 约 3.4GB（bf16），Z-Image 用 fp8 存权重时它也用 fp8，显存占用减半。
-    它平时放在内存里，出图时才搬上显卡（见 _handle_generate），不和本地 LLM 抢显存。
+    ControlNet 约 2GB（bf16）。它平时放在内存里，去噪第一步才搬上显卡（见 bring_to_gpu），
+    去噪完就搬回内存，不和文本编码器、VAE 解码、本地 LLM 抢显存。
     """
     from app import poses
 
@@ -361,22 +363,38 @@ def _controlnet_pipeline(pipe: Any, model_key: str, torch: Any) -> Any:
         controlnet = ZImageControlNetModel.from_pretrained(str(poses.CONTROLNET_DIR), torch_dtype=torch.bfloat16)
     except Exception as exc:  # noqa: BLE001
         raise EngineError(500, f"ControlNet 加载失败（第一次加载要联网读取它的配置）：{str(exc)[:300]}") from exc
-    if loaded.memory_mode and "fp8" in loaded.memory_mode:
-        # 要在挂到 transformer 之前做：挂上之后它会借用 transformer 的几层，那几层已经是 fp8 了
-        controlnet.enable_layerwise_casting(storage_dtype=torch.float8_e4m3fn, compute_dtype=torch.bfloat16)
-
+    # Lite 版 bf16 只有 2GB，不像 transformer 那样用 fp8 存：fp8 每层都要临时转回 bf16，显存反复申请释放会多占几 GB
     transformer = pipe.transformer
+    # 挂到 transformer 之前记下它自己的层。挂上之后 controlnet.to() 会连借来的 transformer 层一起搬：
+    # 搬回内存时 accelerate 看到 transformer 第一个参数已在内存，就不再卸载 transformer，6GB 留在显卡上（实测）
+    loaded.controlnet_own = [module for _, module in controlnet.named_children()]
 
-    def bring_transformer(_module: Any, _args: Any) -> None:
+    def bring_to_gpu(_module: Any, _args: Any) -> None:
         # ControlNet 每一步都先于 transformer 运行，而且直接调用 transformer 的嵌入层和 refiner 层；
         # CPU offload 时那几层这时可能还在内存里，先按 offload 的规矩把 transformer 搬上显卡
+        # （这一步同时把文本编码器请下显卡）。
         hook = getattr(transformer, "_hf_hook", None)
         if hook is not None and hasattr(hook, "pre_forward"):
             hook.pre_forward(transformer)
+        # ControlNet 自己等到这时才上显卡：编码提示词时显卡上是 8GB 的文本编码器，
+        # 那时就放上去的话两者叠加，显存峰值多出一个 ControlNet，16GB 的卡容易爆（实测）
+        if not loaded.controlnet_on_gpu and torch.cuda.is_available():
+            _move_controlnet("cuda")
 
-    controlnet.register_forward_pre_hook(bring_transformer)
+    controlnet.register_forward_pre_hook(bring_to_gpu)
     loaded.controlnet_pipe = ZImageControlNetPipeline(**pipe.components, controlnet=controlnet)
     return loaded.controlnet_pipe
+
+
+def _move_controlnet(device: str) -> None:
+    """只搬 ControlNet 自己的层；借用的 transformer 层由 transformer 的 offload 管。"""
+    for module in loaded.controlnet_own:
+        module.to(device)
+    loaded.controlnet_on_gpu = device != "cpu"
+    if device == "cpu":
+        import torch
+
+        torch.cuda.empty_cache()
 
 
 def _load_init_image(path: str, width: int, height: int) -> Any:
@@ -401,7 +419,7 @@ def _handle_generate(conn: Any, job: dict[str, Any]) -> None:
         from app import poses
 
         try:
-            extra["control_image"] = poses.control_image(job["pose_id"], job["pose_mode"], job["width"], job["height"])
+            extra["control_image"] = poses.control_image(job["pose_id"], job["width"], job["height"])
         except (OSError, ValueError) as exc:
             raise EngineError(400, "姿势图片读取失败，可能还没下载完整，重新下载姿势库试试。") from exc
         extra["controlnet_conditioning_scale"] = job["pose_scale"]
@@ -413,14 +431,15 @@ def _handle_generate(conn: Any, job: dict[str, Any]) -> None:
         pipe = _img2img_pipeline(pipe, job["model"])
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    if controlnet is not None:
-        controlnet.to(device)
     generator = torch.Generator(device=device).manual_seed(int(job["seed"]))
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
 
     def on_step_end(_pipe: Any, step: int, _timestep: Any, callback_kwargs: dict[str, Any]) -> dict[str, Any]:
         conn.send({"type": "progress", "step": step + 1})
+        if controlnet is not None and loaded.controlnet_on_gpu and step + 1 >= job["steps"]:
+            # 去噪完了，接下来 VAE 解码用不到 ControlNet：先把它的 3.4GB 让出来，解码时显存更宽裕
+            _move_controlnet("cpu")
         return callback_kwargs
 
     # Turbo 这类 CFG=0 的蒸馏模型不用反向提示词
@@ -438,17 +457,37 @@ def _handle_generate(conn: Any, job: dict[str, Any]) -> None:
             **extra,
         )
     except RuntimeError as exc:
+        if _cuda_failure(exc):
+            raise  # 交给 worker_main：CUDA 出错后这个进程不能再用了
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         raise EngineError(500, str(exc)) from exc
     finally:
-        if controlnet is not None and device == "cuda":
-            # 出完图把 ControlNet 搬回内存：下一张可能不用姿势，或者要把显存让给本地 LLM
-            controlnet.to("cpu")
-            torch.cuda.empty_cache()
+        if controlnet is not None and loaded.controlnet_on_gpu:
+            # 出完图把 ControlNet 搬回内存：下一张可能不用姿势，或者要把显存让给本地 LLM。
+            # 显存爆了以后这里也会失败，不能盖掉原来的错误
+            try:
+                _move_controlnet("cpu")
+            except RuntimeError:
+                pass
 
     result.images[0].save(job["image_path"])
+    if torch.cuda.is_available():
+        # VAE 解码留下的几 GB 缓存还给系统：桌面窗口、本地 LLM 和别的程序也要用显卡
+        torch.cuda.empty_cache()
     conn.send({"type": "done", "torch_memory": torch_memory_snapshot(torch)})
+
+
+OOM_DETAIL = (
+    "显存不够（CUDA out of memory）。出图进程已经自动重启，再点一次「生成图片」通常就行；"
+    "还不行的话，关掉其他占显卡的程序（游戏、视频、浏览器里的大网页），或者把画面尺寸调小。"
+)
+
+
+def _cuda_failure(exc: BaseException) -> bool:
+    """CUDA 层面的错误（显存不够、非法访问等）：出错后进程里的显存状态不可靠，后面的出图都会接着失败。"""
+    text = str(exc)
+    return type(exc).__name__ in {"OutOfMemoryError", "AcceleratorError"} or "CUDA error" in text or "CUDA out of memory" in text
 
 
 def _handle_park() -> None:
@@ -492,6 +531,13 @@ def worker_main(conn: Any) -> None:
             _handle_generate(conn, message["job"])
         except EngineError as exc:
             conn.send({"type": "error", "status": exc.status, "detail": exc.detail, "state": state()})
-        except Exception as exc:  # noqa: BLE001 - 任何异常都回报给主进程，而不是让进程退出
+        except Exception as exc:  # noqa: BLE001 - 任何异常都回报给主进程
             traceback.print_exc()
+            if _cuda_failure(exc):
+                # CUDA 出错后连清显存、搬模型都会失败，这个进程留着只会让后面每次出图都报错：
+                # 回报完就退出，主进程下次出图会开一个新进程（模型从内存重新加载）
+                oom = "out of memory" in str(exc).lower() or type(exc).__name__ == "OutOfMemoryError"
+                detail = OOM_DETAIL if oom else f"显卡出错，出图进程已经自动重启，再点一次「生成图片」：{str(exc)[:300]}"
+                conn.send({"type": "error", "status": 500, "detail": detail, "state": {**state(), "model_key": None}})
+                return
             conn.send({"type": "error", "status": 500, "detail": str(exc)[:500], "state": state()})

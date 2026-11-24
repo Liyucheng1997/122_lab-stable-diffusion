@@ -84,8 +84,7 @@ class GenerateRequest(BaseModel):
     strength: float = Field(default=0.6, ge=0.05, le=1.0)
     # 参考姿势：姿势库里的 id，用 ControlNet 控制人物动作（只支持 Z-Image），和图生图二选一
     pose: str = Field(default="", max_length=80, pattern=r"^[A-Za-z0-9_-]*$")
-    pose_mode: str = Field(default="outline", pattern=r"^(outline|line)$")
-    pose_scale: float = Field(default=0.7, ge=0.3, le=1.2)
+    pose_scale: float = Field(default=poses.DEFAULT_SCALE, ge=0.3, le=1.2)
     # 一次生成多张时，前端给这几张同一个批次号，历史里据此折叠成一组
     batch: str = Field(default="", max_length=40, pattern=r"^[A-Za-z0-9_-]*$")
 
@@ -769,7 +768,6 @@ def _generate(request: GenerateRequest) -> dict[str, Any]:
             "init_image_path": str(init_path) if init_path else "",
             "strength": request.strength,
             "pose_id": request.pose if pose else "",
-            "pose_mode": request.pose_mode,
             "pose_scale": request.pose_scale,
         }
 
@@ -859,8 +857,9 @@ def _generate(request: GenerateRequest) -> dict[str, Any]:
                     "strength": request.strength if init_url else None,
                     "pose": request.pose if pose else "",
                     "pose_name": poses.describe(pose) if pose else "",
-                    "pose_mode": request.pose_mode if pose else None,
                     "pose_scale": request.pose_scale if pose else None,
+                    # 不同 ControlNet 合适的强度不一样（完整版 0.7、Lite 0.85），复用参数时据此判断要不要沿用
+                    "pose_controlnet": poses.CONTROLNET["id"] if pose else None,
                     "batch": request.batch,
                     "seconds": round(time.time() - started, 2),
                     "gpu_metrics": gpu_metrics,
