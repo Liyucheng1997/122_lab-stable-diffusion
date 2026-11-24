@@ -205,9 +205,21 @@ def _conversation(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return merged
 
 
-def chat(messages: list[dict[str, Any]], family: str, model_label_target: str) -> dict[str, Any]:
+POSE_GUIDE = """
+用户在参数面板里选了参考姿势：{pose}。
+出图时会用这个姿势的人体轮廓图控制人物的动作、朝向和在画面里的位置（ControlNet），所以：
+- prompt 里人物的动作、手脚的位置、身体朝向和镜头视角要和这个姿势一致，把动作具体写出来；人数也要一致（"双人"姿势写两个人）。
+- 姿势图是没有脸、没有衣服的白色人体模型，只是动作参考：prompt 里照常写真实的人物外貌、发型、服装、场景和光线，不要写"人体模型""白模"。
+- 画面比例跟着姿势图走（竖构图 3:4），aspect 填 3:4。
+- count 大于 1 时，variants 只换服装、光线、背景或表情，不要改动作和视角。
+- 用户说"不要这个姿势""换个动作"时，在 reply 里提醒他到参数面板的「参考姿势」里移除或换一个。"""
+
+
+def chat(messages: list[dict[str, Any]], family: str, model_label_target: str, pose: str = "") -> dict[str, Any]:
     family = family if family in FAMILY_GUIDE else "sdxl"
     system = SYSTEM_PROMPT.format(model_label=model_label_target, family_guide=FAMILY_GUIDE[family], max_count=MAX_COUNT)
+    if pose and family == "zimage":
+        system += "\n" + POSE_GUIDE.format(pose=pose)
     conversation = _conversation(messages)
     has_image = any(m.get("image") for m in conversation)
     if has_image and not mmproj_path():

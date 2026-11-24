@@ -38,6 +38,8 @@ const ICONS = {
   plus: '<path d="M12 5v14"/><path d="M5 12h14"/>',
   sidebar: '<rect x="3" y="4" width="18" height="16" rx="3"/><path d="M9 4v16"/>',
   up: '<path d="M12 19V5"/><path d="m5 12 7-7 7 7"/>',
+  person: '<circle cx="12" cy="4.5" r="2.5"/><path d="M12 7v7"/><path d="m8 21 4-7 4 7"/><path d="M5 10.5 12 9l7 1.5"/>',
+  search: '<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>',
 };
 
 function icon(name, size = 16) {
@@ -277,6 +279,8 @@ let currentResult = null; // { url, name, seed }
 let isBusy = false;
 let refImage = null; // 图生图参考图 { src: data URL 或 /outputs/ 下的地址, width, height }
 let refToken = 0;
+let poseLib = null; // 姿势库（/api/poses）：姿势列表、下载状态、ControlNet 状态
+let pose = null; // 选着的参考姿势 { id, name, system, category, angle }；姿势库还没读到时只有 id
 let batch = null; // 一次生成多张时的进度 { index, count }
 let stopRequested = false;
 let busyTimer = null;
@@ -468,6 +472,7 @@ function updateFamily(announce = true) {
   updateParamHint();
   updateStrengthNote();
   updateCountNote();
+  renderPose();
 }
 
 // 步数 / CFG 偏离当前模型的推荐值时，给出提示和一键恢复
@@ -564,6 +569,9 @@ function formPayload() {
     guidance_scale: readNumber(guidanceInput),
     seed: readNumber(seedInput),
     strength: readStrength(),
+    pose: pose?.id || "",
+    pose_mode: poseMode(),
+    pose_scale: readPoseScale(),
   };
 }
 
@@ -603,7 +611,11 @@ function applyParams(params, { includeSeed = true } = {}) {
   if (includeSeed) seedInput.value = isNum(params.seed) ? params.seed : "";
   if (isNum(params.strength)) setPair(strengthInput, strengthRange, params.strength);
   if (isNum(params.count)) setPair(countInput, countRange, params.count);
+  if (params.pose_mode) setPoseMode(params.pose_mode);
+  if (isNum(params.pose_scale)) setPair(poseScaleInput, poseScaleRange, params.pose_scale);
   setRef(params.init_image || null);
+  // 没记 pose 的（旧图片、旧表单）都是没用姿势出的图
+  setPose(params.init_image ? null : params.pose || null, { quiet: true });
   lastFamily = familyOf(currentModel());
   updateFamily(false);
   saveForm();
@@ -715,6 +727,11 @@ async function setRef(src, { fit = false } = {}) {
     renderRef();
     return;
   }
+  if (pose) {
+    // ControlNet 管线不做图生图：两者只能用一个，后放的为准
+    setPose(null, { quiet: true });
+    toast("参考姿势和图生图不能同时用，已移除参考姿势", "info", 3500);
+  }
   try {
     const img = await loadImage(src);
     if (token !== refToken) return;
@@ -781,6 +798,357 @@ document.addEventListener("paste", (event) => {
   if (promptMode() === "agent") agentAttachFile(file);
   else useRefFile(file);
 });
+
+/* ---------------- 参考姿势：姿势库（1439 张白模姿势）+ Z-Image ControlNet ---------------- */
+const poseDrop = $("#poseDrop");
+const poseBox = $("#poseBox");
+const poseThumb = $("#poseThumb");
+const poseName = $("#poseName");
+const poseMeta = $("#poseMeta");
+const poseTag = $("#poseTag");
+const poseControls = $("#poseControls");
+const poseModeSeg = $("#poseModeSeg");
+const poseScaleInput = $("#poseScale");
+const poseScaleRange = $("#poseScaleRange");
+const poseNote = $("#poseNote");
+const poseHint = $("#poseHint");
+const cnDownload = $("#cnDownload");
+const cnDlText = $("#cnDlText");
+const cnDlBtn = $("#cnDlBtn");
+const cnDlMeter = $("#cnDlMeter");
+const cnDlBar = $("#cnDlBar");
+const cnDlSub = $("#cnDlSub");
+const composerPose = $("#composerPose");
+const composerPoseText = $("#composerPoseText");
+const POSE_ANGLES = ["正面", "斜侧", "侧面", "俯视", "仰视"];
+const POSE_FILTER_KEY = "aigen.pose.filter";
+// 实测（同一提示词、同一 seed）：轮廓 0.7 动作对、衣服自然；0.45 基本不跟姿势；0.8 起衣服会贴着身体轮廓
+const POSE_NOTES = {
+  outline: "只按人物外轮廓摆动作，衣服、脸、背景照提示词画。0.7 左右最自然；低于 0.6 动作会走样，高于 0.8 衣服会贴着身体轮廓。",
+  line: "按白模线稿摆动作，手脚位置更准，但白模的关节圆圈和分割线容易画成紧身衣。建议 0.6～0.7。",
+};
+let posePollTimer = null;
+let poseLibRender = null; // 姿势库弹窗打开时的重绘函数
+
+const poseThumbUrl = (id) => `/poses/thumbs/${encodeURIComponent(id)}.jpg`;
+
+function poseMode() {
+  return $("button.active", poseModeSeg)?.dataset.mode || "outline";
+}
+function setPoseMode(mode) {
+  for (const btn of $$("button", poseModeSeg)) btn.classList.toggle("active", btn.dataset.mode === (mode === "line" ? "line" : "outline"));
+  poseNote.textContent = POSE_NOTES[poseMode()];
+}
+function readPoseScale() {
+  const value = Number(poseScaleInput.value);
+  return Number.isFinite(value) && value > 0 ? Math.max(0.3, Math.min(1.2, value)) : 0.7;
+}
+
+// id → 姿势库里的完整条目（姿势库还没读到时先只记 id，读到后再补全）
+function resolvePose(value) {
+  const id = typeof value === "string" ? value : value?.id;
+  if (!id) return null;
+  return poseLib?.items.find((p) => p.id === id) || { id };
+}
+
+function poseLabel(p) {
+  return p?.name ? `${p.name}（${p.angle}）` : p?.id || "";
+}
+
+function renderPose() {
+  const on = !!pose;
+  poseDrop.hidden = on;
+  poseBox.hidden = !on;
+  poseControls.hidden = !on;
+  poseTag.textContent = on ? "已选" : "不用";
+  poseTag.classList.toggle("primary", on);
+  composerPose.classList.toggle("chip-on", on);
+  composerPoseText.textContent = on ? `姿势 · ${pose.name || pose.id}` : "姿势";
+  if (on) {
+    poseThumb.src = poseThumbUrl(pose.id);
+    poseName.textContent = pose.name || pose.id;
+    poseMeta.textContent = pose.system ? `${pose.system} · ${pose.category} · ${pose.angle}视角` : "";
+  } else {
+    poseThumb.removeAttribute("src");
+  }
+  poseNote.textContent = POSE_NOTES[poseMode()];
+  const family = familyOf(currentModel());
+  const wrongModel = on && family !== "zimage";
+  poseHint.hidden = !wrongModel;
+  poseHint.textContent = wrongModel ? `参考姿势只支持 Z-Image Turbo，当前是 ${FAMILY_LABELS[family]}，出图前请换模型或移除姿势。` : "";
+  renderControlnetBox();
+}
+
+function renderControlnetBox() {
+  const cn = poseLib?.controlnet;
+  const need = !!pose && !!cn && !cn.installed;
+  cnDownload.hidden = !need;
+  if (!need) return;
+  const job = cn.job;
+  const busy = job?.status === "downloading" || job?.status === "converting";
+  cnDlBtn.hidden = busy;
+  cnDlMeter.hidden = !busy;
+  if (job?.status === "converting") {
+    cnDlBar.style.width = "100%";
+    cnDlText.textContent = "下载完成，正在转换格式…";
+    cnDlSub.textContent = "大约一分钟。";
+  } else if (busy) {
+    const total = job.total || cn.size_gb * 1e9;
+    const pct = total ? Math.min(100, (job.downloaded / total) * 100) : 0;
+    cnDlBar.style.width = `${pct}%`;
+    cnDlText.textContent = `正在下载姿势控制模型 ${Math.floor(pct)}%`;
+    cnDlSub.textContent = `${formatSize(job.downloaded)} / ${formatSize(total)} · 关掉网页也会在后台继续下载`;
+  } else if (job?.status === "error") {
+    cnDlText.textContent = "下载失败";
+    cnDlBtn.textContent = "重试";
+    cnDlSub.textContent = job.error || "";
+  } else {
+    cnDlText.textContent = `还需要姿势控制模型（约 ${cn.size_gb} GB）`;
+    cnDlBtn.textContent = "下载";
+    cnDlSub.textContent = `${cn.label}（阿里 PAI，${cn.license}），从 Hugging Face 下载到 models/controlnet，只需一次。`;
+  }
+}
+
+// next：姿势库条目或 id，null 表示不用姿势
+function setPose(next, { quiet = false } = {}) {
+  pose = resolvePose(next);
+  if (pose && refImage) {
+    setRef(null);
+    if (!quiet) toast("参考姿势和图生图不能同时用，已移除参考图", "info", 3500);
+  }
+  // 姿势图都是 3:4 竖图：画面比例跟过去，人物不会被缩小、两边留空
+  if (pose && !quiet && familyOf(currentModel()) === "zimage" && activeRatio() !== "3:4") {
+    applyRatio("3:4");
+    toast("已按姿势图把画面比例切到 3:4", "info", 3000);
+  }
+  renderPose();
+  saveForm();
+}
+
+async function refreshPoses() {
+  const response = await fetch("/api/poses");
+  const data = await response.json();
+  const was = poseLib;
+  poseLib = data;
+  if (was?.job?.status === "downloading" && data.job?.status === "done") toast(`姿势库下载完成 · ${data.count} 张`, "success", 4000);
+  if (["downloading", "converting"].includes(was?.controlnet.job?.status) && data.controlnet.installed) toast("姿势控制模型已就绪", "success", 4000);
+  if (pose) pose = resolvePose(pose);
+  renderPose();
+  poseLibRender?.();
+  clearTimeout(posePollTimer);
+  const busy = data.job?.status === "downloading" || ["downloading", "converting"].includes(data.controlnet.job?.status);
+  if (busy) posePollTimer = setTimeout(() => refreshPoses().catch(() => {}), 1200);
+}
+
+async function downloadPoseLibrary() {
+  try {
+    await postJson("/api/poses/download", {});
+  } catch (error) {
+    toast(error.message || "下载失败", "error", 4000);
+  }
+  await refreshPoses().catch(() => {});
+}
+
+async function downloadControlnet() {
+  try {
+    await postJson("/api/controlnet/download", {});
+    toast("开始下载姿势控制模型");
+  } catch (error) {
+    toast(error.message || "下载失败", "error", 4000);
+  }
+  await refreshPoses().catch(() => {});
+}
+
+// 姿势库弹窗：按体系 / 分类 / 视角筛选，一组姿势一张卡片，卡片下面切视角，点图选用
+function openPoseLibrary() {
+  const saved = store.get(POSE_FILTER_KEY, {}) || {};
+  const filter = { system: saved.system || "", category: "", angle: saved.angle || "", query: "" };
+  const shownAngle = new Map(); // 每组卡片当前显示的视角
+
+  const modal = document.createElement("div");
+  modal.className = "modal pose-lib";
+  modal.innerHTML = `
+    <div class="modal-header">
+      <div class="pose-lib-title">姿势库 <span class="pose-lib-count" data-role="count"></span></div>
+      <button class="modal-x" type="button" data-act="close" title="关闭 (Esc)">${icon("x", 15)}</button>
+    </div>
+    <div class="pose-toolbar">
+      <div class="seg pose-seg" data-role="system"></div>
+      <select class="input pose-select" data-role="category"></select>
+      <div class="seg pose-seg" data-role="angle"></div>
+      <label class="pose-search">${icon("search", 14)}<input class="input" data-role="query" type="search" placeholder="搜动作，如：站姿、跪、蹲、举手" /></label>
+    </div>
+    <div class="pose-body"><div data-role="notice"></div><div class="pose-grid" data-role="grid"></div></div>`;
+  const systemSeg = $("[data-role=system]", modal);
+  const categorySel = $("[data-role=category]", modal);
+  const angleSeg = $("[data-role=angle]", modal);
+  const queryInput = $("[data-role=query]", modal);
+  const grid = $("[data-role=grid]", modal);
+  const notice = $("[data-role=notice]", modal);
+  const countEl = $("[data-role=count]", modal);
+
+  const groupsOf = (items) => {
+    const groups = new Map();
+    for (const p of items) {
+      const key = `${p.system}|${p.number}`;
+      if (!groups.has(key)) groups.set(key, { key, name: p.name, system: p.system, category: p.category, angles: {} });
+      groups.get(key).angles[p.angle] = p;
+    }
+    return [...groups.values()];
+  };
+
+  const noticeHtml = () => {
+    const lib = poseLib;
+    if (!lib) return `<div class="pose-notice">读取姿势库…</div>`;
+    let html = "";
+    if (!lib.installed) {
+      const job = lib.job;
+      if (job?.status === "downloading") {
+        const pct = job.total ? Math.floor((job.done / job.total) * 100) : 0;
+        html += `<div class="dl-box"><div class="dl-head"><span class="dl-text">正在下载姿势库 ${pct}%</span></div><div class="meter"><span style="width:${pct}%"></span></div><span class="field-note">${job.done} / ${job.total || "--"} 个文件</span></div>`;
+      } else {
+        html += `<div class="dl-box"><div class="dl-head"><span class="dl-text">${job?.status === "error" ? "下载没完成" : "姿势库还没下载"}</span><button class="btn btn-primary btn-sm" type="button" data-act="dl-poses">${job?.status === "error" ? "接着下载" : "下载姿势库（约 700 MB）"}</button></div><span class="field-note">${escapeHtml(job?.error || "")} 来自 ai-pose-gallery（原作者ギア @giaaibusi），1439 张多角度白模姿势，下载到项目的 poses 目录，只供个人学习创作。</span></div>`;
+      }
+    }
+    const cn = lib.controlnet;
+    if (lib.installed && !cn.installed) {
+      const st = cn.job?.status;
+      const busy = st === "downloading" || st === "converting";
+      const pct = busy && cn.job.total ? Math.floor((cn.job.downloaded / cn.job.total) * 100) : 0;
+      html += `<div class="pose-notice">${busy ? (st === "converting" ? "姿势控制模型下载完成，正在转换格式…" : `正在下载姿势控制模型 ${pct}%`) : `选好姿势后，出图还需要姿势控制模型（约 ${cn.size_gb} GB）。`}${busy ? "" : ` <button class="link-btn" type="button" data-act="dl-cn">现在下载</button>`}</div>`;
+    }
+    return html;
+  };
+
+  const render = () => {
+    const lib = poseLib;
+    const items = lib?.items || [];
+    countEl.textContent = items.length ? `${items.length} 张 · ${groupsOf(items).length} 组动作` : "";
+    notice.innerHTML = noticeHtml();
+    systemSeg.innerHTML = ["", ...(lib?.systems || [])]
+      .map((s) => `<button type="button" data-system="${escapeHtml(s)}" class="${s === filter.system ? "active" : ""}">${escapeHtml(s || "全部")}</button>`)
+      .join("");
+    angleSeg.innerHTML = ["", ...POSE_ANGLES]
+      .map((a) => `<button type="button" data-angle="${a}" class="${a === filter.angle ? "active" : ""}">${a || "全部视角"}</button>`)
+      .join("");
+    const inSystem = items.filter((p) => !filter.system || p.system === filter.system);
+    const categories = [...new Set(inSystem.map((p) => p.category))];
+    if (filter.category && !categories.includes(filter.category)) filter.category = "";
+    categorySel.innerHTML = `<option value="">全部分类</option>${categories.map((c) => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join("")}`;
+    categorySel.value = filter.category;
+    renderGrid(inSystem);
+  };
+
+  const renderGrid = (inSystem) => {
+    const q = filter.query.trim().toLowerCase();
+    const groups = groupsOf(inSystem.filter((p) => !filter.category || p.category === filter.category)).filter((g) => {
+      if (filter.angle && !g.angles[filter.angle]) return false;
+      return !q || `${g.name} ${g.category} ${g.system}`.toLowerCase().includes(q);
+    });
+    if (poseLib?.installed && !groups.length) {
+      grid.innerHTML = `<div class="empty pose-empty">${icon("search", 26)}<p>没有符合条件的姿势</p></div>`;
+      return;
+    }
+    grid.innerHTML = groups
+      .map((g) => {
+        const shown = g.angles[filter.angle] || g.angles[shownAngle.get(g.key)] || g.angles["正面"] || Object.values(g.angles)[0];
+        const selected = pose && Object.values(g.angles).some((p) => p.id === pose.id);
+        const angles = POSE_ANGLES.filter((a) => g.angles[a])
+          .map((a) => `<button type="button" data-id="${escapeHtml(g.angles[a].id)}" data-key="${escapeHtml(g.key)}" class="${g.angles[a] === shown ? "active" : ""}" title="${a}视角">${a.slice(0, 1)}</button>`)
+          .join("");
+        return `
+          <article class="pose-card${selected ? " is-selected" : ""}" data-key="${escapeHtml(g.key)}">
+            <button class="pose-media" type="button" data-pick="${escapeHtml(shown.id)}" title="用这个姿势：${escapeHtml(g.name)}（${shown.angle}）">
+              <img src="${poseThumbUrl(shown.id)}" alt="${escapeHtml(g.name)}" loading="lazy" />
+            </button>
+            <div class="pose-info">
+              <div class="pose-name">${escapeHtml(g.name)}</div>
+              <div class="pose-sub">${escapeHtml(g.category)}${filter.system ? "" : ` · ${escapeHtml(g.system)}`}</div>
+              <div class="pose-angles">${angles}</div>
+            </div>
+          </article>`;
+      })
+      .join("");
+  };
+
+  const close = openModal(modal);
+  new MutationObserver((_, observer) => {
+    if (!modal.isConnected) {
+      if (poseLibRender === render) poseLibRender = null;
+      observer.disconnect();
+    }
+  }).observe(document.body, { childList: true });
+  const remember = () => store.set(POSE_FILTER_KEY, { system: filter.system, angle: filter.angle });
+
+  modal.addEventListener("click", (event) => {
+    const target = event.target;
+    if (target.closest('[data-act="close"]')) return close();
+    if (target.closest('[data-act="dl-poses"]')) return downloadPoseLibrary();
+    if (target.closest('[data-act="dl-cn"]')) return downloadControlnet();
+    const sys = target.closest("button[data-system]");
+    if (sys) {
+      filter.system = sys.dataset.system;
+      remember();
+      return render();
+    }
+    const ang = target.closest("button[data-angle]");
+    if (ang) {
+      filter.angle = ang.dataset.angle;
+      remember();
+      return render();
+    }
+    const angleBtn = target.closest(".pose-angles button");
+    if (angleBtn) {
+      // 只换这张卡片显示的视角，不重绘整个列表
+      const item = poseLib.items.find((p) => p.id === angleBtn.dataset.id);
+      shownAngle.set(angleBtn.dataset.key, item.angle);
+      const card = angleBtn.closest(".pose-card");
+      const media = $(".pose-media", card);
+      media.dataset.pick = item.id;
+      media.title = `用这个姿势：${item.name}（${item.angle}）`;
+      $("img", media).src = poseThumbUrl(item.id);
+      for (const b of $$(".pose-angles button", card)) b.classList.toggle("active", b === angleBtn);
+      return;
+    }
+    const pick = target.closest("[data-pick]");
+    if (pick) {
+      setPose(pick.dataset.pick);
+      close();
+      toast(`已选姿势：${poseLabel(pose)}`, "success");
+    }
+  });
+  categorySel.addEventListener("change", () => {
+    filter.category = categorySel.value;
+    render();
+  });
+  queryInput.addEventListener("input", () => {
+    filter.query = queryInput.value;
+    render();
+  });
+  poseLibRender = render;
+  render();
+  refreshPoses().catch(() => {});
+}
+
+for (const el of [poseDrop, poseThumb, $("#poseChangeBtn"), composerPose]) el.addEventListener("click", openPoseLibrary);
+$("#poseClearBtn").addEventListener("click", () => {
+  setPose(null);
+  toast("已移除参考姿势");
+});
+cnDlBtn.addEventListener("click", async () => {
+  cnDlBtn.disabled = true;
+  await downloadControlnet();
+  cnDlBtn.disabled = false;
+});
+poseModeSeg.addEventListener("click", (event) => {
+  const btn = event.target.closest("button[data-mode]");
+  if (!btn) return;
+  setPoseMode(btn.dataset.mode);
+  // 两种方式合适的强度不一样：线稿超过 0.7 就容易出紧身衣
+  if (btn.dataset.mode === "line" && readPoseScale() > 0.7) setPair(poseScaleInput, poseScaleRange, 0.65);
+  saveForm();
+});
+bindPair(poseScaleInput, poseScaleRange);
 
 /* ---------------- 三个页签：AI 助手（对话） / 手动出图（表单） / 历史画廊 ---------------- */
 const PARAMS_KEY = "aigen.params.open";
@@ -1096,7 +1464,8 @@ async function applyAgentPlan(turn) {
   const img2img = !!(ref && turn.use_reference && refImage);
   promptInput.value = turn.prompt;
   negativeInput.value = turn.negative_prompt || "";
-  if (!img2img && SIZES[familyOf(currentModel())][turn.aspect]) applyRatio(turn.aspect);
+  // 图生图跟着参考图的比例，参考姿势跟着姿势图（3:4），都不听助手的
+  if (!img2img && !pose && SIZES[familyOf(currentModel())][turn.aspect]) applyRatio(turn.aspect);
   setPair(stepsInput, stepsRange, turn.steps);
   setPair(guidanceInput, guidanceRange, turn.guidance_scale);
   seedInput.value = turn.seed == null ? "" : turn.seed;
@@ -1148,15 +1517,15 @@ function agentSetProgress(text) {
   if (el) el.textContent = text;
 }
 
-function agentGenEnd(seeds, prompt, strength, error) {
+function agentGenEnd(seeds, prompt, strength, error, poseText = "") {
   if (!agentRun) return;
   const msg = agentRun.msg;
   agentRun = null;
   agent.updated = Date.now();
   if (error) msg.error = seeds.length ? `第 ${seeds.length + 1} 张生成失败：${error}` : error;
   if (seeds.length) {
-    // 放了参考图时出的是图生图，画面会被参考图带着走，要让用户和助手都知道
-    const ref = strength ? `（图生图：按参考图重绘，幅度 ${strength}）` : "";
+    // 放了参考图时出的是图生图，画面会被参考图带着走；用了参考姿势时人物照着姿势摆。要让用户和助手都知道
+    const ref = strength ? `（图生图：按参考图重绘，幅度 ${strength}）` : poseText ? `（参考姿势：${poseText}）` : "";
     const text = `已出图 ${seeds.length} 张，seed：${seeds.join("、")}${ref}`;
     msg.result = text;
     if (msg.local) agent.pending = `用户按参数面板手动${text}，提示词是：${prompt}`;
@@ -1207,6 +1576,7 @@ async function sendAgent() {
           .filter((m) => !m.local)
           .map((m) => (m.role === "user" ? { role: "user", content: m.sent, image: m.image || "", image_mode: m.image ? m.imageMode || "" : "" } : { role: "assistant", turn: m.turn })),
         target_model: currentModel(),
+        pose: pose?.id || "",
       }),
     });
     const data = await response.json();
@@ -1435,6 +1805,7 @@ function renderResultMeta(params) {
     `${params.steps} 步`,
     `CFG ${params.guidance_scale}`,
     params.init_image ? `图生图 · 幅度 ${params.strength}` : null,
+    params.pose ? `姿势 ${poseLabel(resolvePose(params.pose))} · ${params.pose_mode === "line" ? "线稿" : "轮廓"} ${params.pose_scale}` : null,
     `Seed ${params.seed}`,
     isNum(params.seconds) ? `${params.seconds.toFixed(1)}s` : null,
   ].filter(Boolean);
@@ -1505,7 +1876,20 @@ async function runGeneration(variants = []) {
     toast(`${preset.label} 还没下载，先点「下载模型」`, "error", 3500);
     return;
   }
+  if (base.pose) {
+    if (familyOf(base.model) !== "zimage") {
+      toast("参考姿势只支持 Z-Image Turbo：换成 Z-Image，或者移除姿势", "error", 4000);
+      return;
+    }
+    if (poseLib && !poseLib.controlnet.installed) {
+      toast("还要先下载姿势控制模型（参数面板「参考姿势」里）", "error", 4000);
+      if (promptMode() === "agent") setParamsOpen(true);
+      cnDownload.scrollIntoView({ block: "center" });
+      return;
+    }
+  }
   const usedRef = refImage;
+  const usedPose = base.pose ? pose : null;
   base.init_image = usedRef ? usedRef.src : "";
   const count = readCount();
   // 助手模式下，同一段对话出的图都归到这段对话的图片夹里
@@ -1568,7 +1952,7 @@ async function runGeneration(variants = []) {
   } finally {
     batch = null;
     setBusy(false);
-    agentGenEnd(seeds, base.prompt, usedRef ? base.strength : null, failure);
+    agentGenEnd(seeds, base.prompt, usedRef ? base.strength : null, failure, usedPose ? poseLabel(usedPose) : "");
   }
 }
 
@@ -2130,6 +2514,7 @@ function refreshAll() {
   refreshStatus();
   refreshImages().catch(() => toast("读取历史图片失败", "error"));
   refreshLoras().catch(() => {});
+  refreshPoses().catch(() => {});
   refreshGpu();
 }
 

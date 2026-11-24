@@ -40,6 +40,7 @@ class LoadedPipeline:
     lora_scale: float | None = None
     memory_mode: str | None = None
     img2img: Any | None = None  # 图生图管线，和 pipe 共用同一套权重，第一次用到时才建
+    controlnet_pipe: Any | None = None  # 姿势控制（Z-Image ControlNet）管线，同样共用权重，第一次选姿势出图时才加载
     on_gpu: bool = False  # 整个模型常驻显存（SD 1.5 / SDXL）；Z-Image 靠 offload，空闲时本来就在内存里
     parked: bool = False  # 已经把显存让给本地 LLM，下次出图前要搬回显卡
 
@@ -338,6 +339,46 @@ def _img2img_pipeline(pipe: Any, model_key: str) -> Any:
     return loaded.img2img
 
 
+def _controlnet_pipeline(pipe: Any, model_key: str, torch: Any) -> Any:
+    """姿势控制管线：Z-Image + ControlNet Union，和文生图共用 transformer / VAE / 文本编码器。
+
+    ControlNet 约 3.4GB（bf16），Z-Image 用 fp8 存权重时它也用 fp8，显存占用减半。
+    它平时放在内存里，出图时才搬上显卡（见 _handle_generate），不和本地 LLM 抢显存。
+    """
+    from app import poses
+
+    if catalog.family_of_model(model_key) != "zimage":
+        raise EngineError(400, "参考姿势只支持 Z-Image Turbo，请先把模型换成 Z-Image Turbo。")
+    if loaded.controlnet_pipe is not None:
+        return loaded.controlnet_pipe
+    if not poses.controlnet_installed():
+        raise EngineError(400, "姿势控制模型（ControlNet）还没下载，先在「参考姿势」里点下载。")
+    from diffusers import ZImageControlNetModel, ZImageControlNetPipeline
+
+    try:
+        # 正常下载完就已经转好了；放进来的是单文件时这里补转一次
+        poses.convert_controlnet()
+        controlnet = ZImageControlNetModel.from_pretrained(str(poses.CONTROLNET_DIR), torch_dtype=torch.bfloat16)
+    except Exception as exc:  # noqa: BLE001
+        raise EngineError(500, f"ControlNet 加载失败（第一次加载要联网读取它的配置）：{str(exc)[:300]}") from exc
+    if loaded.memory_mode and "fp8" in loaded.memory_mode:
+        # 要在挂到 transformer 之前做：挂上之后它会借用 transformer 的几层，那几层已经是 fp8 了
+        controlnet.enable_layerwise_casting(storage_dtype=torch.float8_e4m3fn, compute_dtype=torch.bfloat16)
+
+    transformer = pipe.transformer
+
+    def bring_transformer(_module: Any, _args: Any) -> None:
+        # ControlNet 每一步都先于 transformer 运行，而且直接调用 transformer 的嵌入层和 refiner 层；
+        # CPU offload 时那几层这时可能还在内存里，先按 offload 的规矩把 transformer 搬上显卡
+        hook = getattr(transformer, "_hf_hook", None)
+        if hook is not None and hasattr(hook, "pre_forward"):
+            hook.pre_forward(transformer)
+
+    controlnet.register_forward_pre_hook(bring_transformer)
+    loaded.controlnet_pipe = ZImageControlNetPipeline(**pipe.components, controlnet=controlnet)
+    return loaded.controlnet_pipe
+
+
 def _load_init_image(path: str, width: int, height: int) -> Any:
     """参考图按输出尺寸居中裁剪并缩放，出图尺寸始终等于用户选的尺寸。"""
     from PIL import Image, ImageOps
@@ -355,12 +396,25 @@ def _handle_generate(conn: Any, job: dict[str, Any]) -> None:
     conn.send({"type": "loaded", "state": state()})
 
     extra: dict[str, Any] = {}
-    if job.get("init_image_path"):
+    controlnet = None
+    if job.get("pose_id"):
+        from app import poses
+
+        try:
+            extra["control_image"] = poses.control_image(job["pose_id"], job["pose_mode"], job["width"], job["height"])
+        except (OSError, ValueError) as exc:
+            raise EngineError(400, "姿势图片读取失败，可能还没下载完整，重新下载姿势库试试。") from exc
+        extra["controlnet_conditioning_scale"] = job["pose_scale"]
+        pipe = _controlnet_pipeline(pipe, job["model"], torch)
+        controlnet = pipe.controlnet
+    elif job.get("init_image_path"):
         extra["image"] = _load_init_image(job["init_image_path"], job["width"], job["height"])
         extra["strength"] = job["strength"]
         pipe = _img2img_pipeline(pipe, job["model"])
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    if controlnet is not None:
+        controlnet.to(device)
     generator = torch.Generator(device=device).manual_seed(int(job["seed"]))
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
@@ -387,6 +441,11 @@ def _handle_generate(conn: Any, job: dict[str, Any]) -> None:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         raise EngineError(500, str(exc)) from exc
+    finally:
+        if controlnet is not None and device == "cuda":
+            # 出完图把 ControlNet 搬回内存：下一张可能不用姿势，或者要把显存让给本地 LLM
+            controlnet.to("cpu")
+            torch.cuda.empty_cache()
 
     result.images[0].save(job["image_path"])
     conn.send({"type": "done", "torch_memory": torch_memory_snapshot(torch)})

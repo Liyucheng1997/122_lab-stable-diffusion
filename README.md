@@ -78,6 +78,39 @@ powershell -ExecutionPolicy Bypass -File .\create_shortcut.ps1
 - 给助手发消息：先让生图模型把显存让出来（权重留在内存里，不用重新加载），再启动 Gemma，通常几秒；
 - 连续出图或连续对话时不会发生切换，只有在两者之间来回时才切一次。
 
+## 参考姿势（姿势库 + ControlNet）
+
+从 1439 张多角度人体姿势里挑一个动作，出图时人物照着这个动作摆，衣服、长相、场景还是按提示词画。只支持 Z-Image Turbo。
+
+- 入口：参数面板的「参考姿势」，或 AI 助手输入框下面的「姿势」。弹出的姿势库按体系（全身标准 / 全身性感 / 上半身 / 双人）、分类、视角（正面 / 斜侧 / 侧面 / 俯视 / 仰视）筛选，也能搜动作名；每张卡片下面切视角，点图选用
+- 选了姿势后画面比例自动切到 3:4（姿势图都是 900 × 1200 竖图），助手也会照着姿势写人物动作和视角
+- 参考姿势和图生图二选一，后放的为准
+- 生成的图的 `.json` 里会记下用的姿势（`pose`、`pose_name`、`pose_mode`、`pose_scale`），「复用参数」会一起带回来
+
+**控制方式和强度**（同一提示词、同一 seed 实测）：
+
+| 控制图 | 效果 |
+| --- | --- |
+| 轮廓（默认）· 0.7 | 从深度图提取的人物外轮廓，没有白模的关节圆圈和分割线。动作准、衣服自然，推荐 |
+| 轮廓 · 0.8 以上 | 动作更贴，但衣服会贴着身体轮廓（例如长袖衬衫变成短上衣） |
+| 0.6 以下 | 动作明显走样；0.45 基本不跟姿势 |
+| 线稿 · 0.6–0.7 | 白模原图线稿，手脚位置更准，但关节圆圈和分割线容易画成白色紧身衣 |
+| 深度图（没有采用） | 强度够摆出姿势时，画出来的就是一个没脸的白模 |
+
+**需要下载两样东西**（第一次选姿势时网页上会提示，点一下就行）：
+
+1. 姿势库（约 700 MB → `poses/`）：来自 [ai-pose-gallery](https://ai-pose-gallery.anhao.app/poses) / GitHub [anhao/ai-pose-gallery-zh](https://github.com/anhao/ai-pose-gallery-zh)，原作者ギア（[@giaaibusi](https://x.com/giaaibusi)）。图片版权归原作者，只供个人学习和创作，所以 `poses/` 不进 git。也可以用命令下载（中断了重跑会接着下）：
+
+   ```powershell
+   .\.venv\Scripts\python scripts\download_poses.py
+   ```
+
+   连不上 GitHub 时在 `.env` 里设 `POSE_MIRROR`（raw.githubusercontent.com 的镜像地址）。
+
+2. 姿势控制模型（6.7 GB → `models/controlnet/`）：阿里 PAI 的 [Z-Image-Turbo-Fun-Controlnet-Union-2.1](https://huggingface.co/alibaba-pai/Z-Image-Turbo-Fun-Controlnet-Union-2.1)（`2602-8steps` 版，Apache-2.0），8 步蒸馏，和 Z-Image Turbo 一样 9 步出图。下载完会在单独的进程里转成 diffusers 目录（第一次要联网读一个很小的配置文件）。
+
+显存和速度（RTX 5080 Laptop 16GB，896 × 1152）：ControlNet 和 Z-Image 一样用 fp8 存权重，出图峰值约 12 GB；它平时放在内存里，出图时才搬上显卡，不和本地 LLM 抢显存。第一张要加载 ControlNet，约 80 秒；之后每张约 25–30 秒。
+
 ## 模型
 
 默认模型是：

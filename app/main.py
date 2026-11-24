@@ -8,6 +8,7 @@ import json
 import os
 import random
 import subprocess
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -21,7 +22,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from app import catalog, local_llm, prompt_ai
+from app import catalog, local_llm, poses, prompt_ai
 from app.local_llm import llm
 from app.worker_client import GenerationWorker, WorkerCrashed, crash_detail, raise_for_error
 
@@ -49,6 +50,7 @@ REF_DIR = OUTPUT_DIR / "refs"  # 图生图用过的参考图
 OUTPUT_DIR.mkdir(exist_ok=True)
 LORA_DIR.mkdir(exist_ok=True)
 MODEL_DIR.mkdir(exist_ok=True)
+poses.POSE_DIR.mkdir(exist_ok=True)
 load_dotenv(ROOT_DIR / ".env")
 
 app = FastAPI(title="Local Stable Diffusion Web UI")
@@ -62,6 +64,7 @@ app.add_middleware(
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 app.mount("/outputs", StaticFiles(directory=OUTPUT_DIR), name="outputs")
+app.mount("/poses", StaticFiles(directory=poses.POSE_DIR), name="poses")
 
 
 class GenerateRequest(BaseModel):
@@ -79,6 +82,10 @@ class GenerateRequest(BaseModel):
     # 图生图：init_image 是 data URL（新上传的图）或 /outputs/ 下的图片地址；留空就是文生图
     init_image: str = Field(default="", max_length=40_000_000)
     strength: float = Field(default=0.6, ge=0.05, le=1.0)
+    # 参考姿势：姿势库里的 id，用 ControlNet 控制人物动作（只支持 Z-Image），和图生图二选一
+    pose: str = Field(default="", max_length=80, pattern=r"^[A-Za-z0-9_-]*$")
+    pose_mode: str = Field(default="outline", pattern=r"^(outline|line)$")
+    pose_scale: float = Field(default=0.7, ge=0.3, le=1.2)
     # 一次生成多张时，前端给这几张同一个批次号，历史里据此折叠成一组
     batch: str = Field(default="", max_length=40, pattern=r"^[A-Za-z0-9_-]*$")
 
@@ -107,6 +114,7 @@ class RefImageRequest(BaseModel):
 class AgentChatRequest(BaseModel):
     messages: list[AgentMessage] = Field(min_length=1, max_length=200)
     target_model: str = Field(default="", max_length=300)  # 模型 ID，用来判断提示词写法和参数范围
+    pose: str = Field(default="", max_length=80)  # 参数面板里选着的参考姿势，助手写提示词时要照着它写人物动作
 
 
 # 模型加载和出图都在独立的工作进程里（app/engine.py），这里只管调度
@@ -478,9 +486,10 @@ def agent_chat(request: AgentChatRequest) -> dict[str, Any]:
                 missing = True  # 参考图已经被删掉：告诉模型这里曾有图，对话照常继续
         messages.append({"role": "user", "content": m.content, "image": image_path, "image_mode": m.image_mode, "image_missing": missing})
     # 和出图互斥：LLM 和生图模型同时算会把 16GB 显存挤爆。先让生图模型把显存让出来（权重留在内存里，不用重新加载）
+    pose = poses.pose_by_id(request.pose) if request.pose else None
     with generation_lock:
         worker.park()
-        return prompt_ai.chat(messages, catalog.family_of_model(model_id), label)
+        return prompt_ai.chat(messages, catalog.family_of_model(model_id), label, pose=poses.describe(pose) if pose else "")
 
 
 @app.post("/api/images/batch")
@@ -569,6 +578,51 @@ def download_model(request: DownloadRequest) -> dict[str, Any]:
     if catalog.disk_free_gb() < need_gb:
         raise HTTPException(status_code=400, detail=f"磁盘剩余 {catalog.disk_free_gb()} GB，不够下载（约需 {need_gb} GB）。")
     return catalog.downloads.start_model(model)
+
+
+@app.get("/api/poses")
+def pose_library() -> dict[str, Any]:
+    data = poses.library()
+    data["controlnet"]["job"] = catalog.downloads.snapshot().get(poses.CONTROLNET["id"])
+    return data
+
+
+@app.post("/api/poses/download")
+def download_poses() -> dict[str, Any]:
+    if catalog.disk_free_gb() < 1:
+        raise HTTPException(status_code=400, detail=f"磁盘剩余 {catalog.disk_free_gb()} GB，不够下载姿势库（约 0.7 GB）。")
+    return poses.downloader.start()
+
+
+@app.post("/api/controlnet/download")
+def download_controlnet() -> dict[str, Any]:
+    if poses.controlnet_installed():
+        return {"status": "done"}
+    need_gb = poses.CONTROLNET["size_gb"] * 2 + 1  # 转换成 diffusers 目录时会短暂同时存在两份
+    if catalog.disk_free_gb() < need_gb:
+        raise HTTPException(status_code=400, detail=f"磁盘剩余 {catalog.disk_free_gb()} GB，不够下载（约需 {need_gb:.0f} GB）。")
+
+    def convert() -> None:
+        # 转换要加载 PyTorch、峰值约 10GB 内存：放进单独的进程，网页服务本身不碰 PyTorch
+        result = subprocess.run(
+            [sys.executable, "-c", "from app.poses import convert_controlnet; convert_controlnet()"],
+            cwd=ROOT_DIR,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if result.returncode != 0:
+            last = (result.stderr or "").strip().splitlines()[-1:] or ["未知错误"]
+            raise RuntimeError(f"格式转换失败：{last[0]}")
+
+    return catalog.downloads.start_file(
+        poses.CONTROLNET["id"],
+        catalog.hf_file_url(poses.CONTROLNET["repo"], poses.CONTROLNET["file"]),
+        poses.CONTROLNET_PATH,
+        after=convert,
+    )
 
 
 @app.get("/api/loras/catalog")
@@ -667,7 +721,18 @@ def _generate(request: GenerateRequest) -> dict[str, Any]:
     init_path: Path | None = None
     init_url = ""
     total_steps = request.steps
-    if request.init_image.strip():
+    pose = None
+    if request.pose:
+        pose = poses.pose_by_id(request.pose)
+        if not pose:
+            raise HTTPException(status_code=400, detail="姿势库里没有这个姿势，可能还没下载姿势库。")
+        if catalog.family_of_model(request.model.strip() or DEFAULT_MODEL) != "zimage":
+            raise HTTPException(status_code=400, detail="参考姿势只支持 Z-Image Turbo，请先把模型换成 Z-Image Turbo，或者移除姿势。")
+        if not poses.controlnet_installed():
+            raise HTTPException(status_code=400, detail="姿势控制模型（ControlNet）还没下载，先在「参考姿势」里点下载。")
+        if request.init_image.strip():
+            raise HTTPException(status_code=400, detail="参考姿势和图生图不能同时用，请移除其中一个。")
+    elif request.init_image.strip():
         # 图生图跳过开头的 步数 × (1 − 重绘幅度) 步（向下取整），只跑剩下的；和 diffusers 的 get_timesteps 一致
         total_steps = request.steps - int(max(request.steps - request.steps * request.strength, 0))
         init_path = _store_init_image(request.init_image)
@@ -701,6 +766,9 @@ def _generate(request: GenerateRequest) -> dict[str, Any]:
             "image_path": str(image_path),
             "init_image_path": str(init_path) if init_path else "",
             "strength": request.strength,
+            "pose_id": request.pose if pose else "",
+            "pose_mode": request.pose_mode,
+            "pose_scale": request.pose_scale,
         }
 
         before_load_gpu = _gpu_snapshot()
@@ -787,6 +855,10 @@ def _generate(request: GenerateRequest) -> dict[str, Any]:
                     "seed": safe_seed,
                     "init_image": init_url,
                     "strength": request.strength if init_url else None,
+                    "pose": request.pose if pose else "",
+                    "pose_name": poses.describe(pose) if pose else "",
+                    "pose_mode": request.pose_mode if pose else None,
+                    "pose_scale": request.pose_scale if pose else None,
                     "batch": request.batch,
                     "seconds": round(time.time() - started, 2),
                     "gpu_metrics": gpu_metrics,
@@ -803,6 +875,7 @@ def _generate(request: GenerateRequest) -> dict[str, Any]:
         "path": str(image_path),
         "seed": safe_seed,
         "init_image": init_url,
+        "pose": request.pose if pose else "",
         "seconds": round(time.time() - started, 2),
         "gpu_metrics": gpu_metrics,
         "images": _image_records(),

@@ -12,7 +12,7 @@
       } catch (e) {}
     </script>
     <link rel="stylesheet" href="/static/tokens.css?v=13" />
-    <link rel="stylesheet" href="/static/styles.css?v=25" />
+    <link rel="stylesheet" href="/static/styles.css?v=26" />
   </head>
   <body>
     <div id="app">
@@ -75,6 +75,7 @@
               <div class="composer-bar">
                 <input id="agentFile" type="file" accept="image/*" hidden />
                 <button id="composerAttachBtn" class="chip" type="button" title="添加参考图：让助手看图写提示词，或按这张图重绘。也可以直接粘贴、拖进来"><span data-icon="image" data-size="14"></span>参考图</button>
+                <button id="composerPose" class="chip" type="button" title="从姿势库选一个动作，出图时人物照着摆"><span data-icon="person" data-size="14"></span><span id="composerPoseText">姿势</span></button>
                 <button id="composerModel" class="chip" type="button" title="换模型、LoRA 和其他参数">Z-Image Turbo</button>
                 <button id="composerRef" class="chip chip-on" type="button" title="参数面板里放着参考图，出图时会按它重绘（图生图）。点这里查看或移除" hidden>图生图中</button>
                 <label class="chip chip-check" title="关掉后，助手只把提示词和参数填进表单，由你点「生成图片」"><input id="agentAuto" type="checkbox" checked /> 自动出图</label>
@@ -191,6 +192,57 @@
                     </div>
                     <span id="strengthNote" class="field-note"></span>
                   </div>
+                </div>
+              </section>
+
+              <section class="section" id="poseSection">
+                <div class="section-head">
+                  <h2 class="section-title">参考姿势</h2>
+                  <span id="poseTag" class="tag">不用</span>
+                </div>
+                <div class="stack">
+                  <button id="poseDrop" class="ref-drop" type="button">
+                    <span data-icon="person" data-size="20"></span>
+                    <span>从姿势库选一个动作</span>
+                    <span class="ref-drop-sub">1439 张多角度人体姿势，出图时人物照着摆（仅 Z-Image）</span>
+                  </button>
+                  <div id="poseBox" class="ref-box pose-box" hidden>
+                    <img id="poseThumb" alt="参考姿势" />
+                    <div class="ref-info">
+                      <div id="poseName" class="ref-size"></div>
+                      <div id="poseMeta" class="field-note"></div>
+                      <div class="ref-actions">
+                        <button id="poseChangeBtn" class="link-btn" type="button">换一个</button>
+                        <button id="poseClearBtn" class="link-btn" type="button">移除</button>
+                      </div>
+                    </div>
+                  </div>
+                  <div id="poseControls" class="stack" hidden>
+                    <div class="field">
+                      <span class="field-label">控制方式</span>
+                      <div class="seg seg-block" id="poseModeSeg">
+                        <button type="button" data-mode="outline" class="active">轮廓</button>
+                        <button type="button" data-mode="line">线稿</button>
+                      </div>
+                    </div>
+                    <div class="field">
+                      <span class="field-label">姿势强度</span>
+                      <div class="slider-row">
+                        <input id="poseScaleRange" type="range" min="0.5" max="1" step="0.05" value="0.7" />
+                        <input id="poseScale" class="input num" type="number" min="0.3" max="1.2" step="0.05" value="0.7" />
+                      </div>
+                      <span id="poseNote" class="field-note"></span>
+                    </div>
+                  </div>
+                  <div id="cnDownload" class="dl-box" hidden>
+                    <div class="dl-head">
+                      <span id="cnDlText" class="dl-text">姿势控制模型还没下载</span>
+                      <button id="cnDlBtn" class="btn btn-primary btn-sm" type="button">下载</button>
+                    </div>
+                    <div class="meter" id="cnDlMeter" hidden><span id="cnDlBar"></span></div>
+                    <span id="cnDlSub" class="field-note"></span>
+                  </div>
+                  <p id="poseHint" class="hint" hidden></p>
                 </div>
               </section>
 
@@ -342,6 +394,6 @@
       </div>
     </div>
     <div id="toastHost" class="toast-host"></div>
-    <script src="/static/app.js?v=27"></script>
+    <script src="/static/app.js?v=28"></script>
   </body>
 </html>

@@ -700,16 +700,17 @@ class DownloadManager:
 
     # ---- LoRA：单文件，自己流式下载以便显示进度 ----
     def start_lora(self, item: dict[str, Any]) -> dict[str, Any]:
-        key = item["id"]
-        return self._start(key, {"kind": "lora"}, lambda: self._download_lora(item))
+        return self.start_file(item["id"], hf_file_url(item["repo"], item["file"]), lora_target(item), kind="lora")
 
-    def _download_lora(self, item: dict[str, Any]) -> None:
-        key = item["id"]
-        target = lora_target(item)
+    def start_file(self, key: str, url: str, target: Path, kind: str = "file", after: Any = None) -> dict[str, Any]:
+        """下载单个文件；after 是下载完以后要做的事（例如格式转换），做完才算完成。"""
+        return self._start(key, {"kind": kind}, lambda: self._download_file(key, url, target, after))
+
+    def _download_file(self, key: str, url: str, target: Path, after: Any = None) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
         partial = target.with_suffix(target.suffix + ".part")
         try:
-            with httpx.stream("GET", hf_file_url(item["repo"], item["file"]), follow_redirects=True, timeout=60) as response:
+            with httpx.stream("GET", url, follow_redirects=True, timeout=60) as response:
                 response.raise_for_status()
                 total = int(response.headers.get("content-length") or 0)
                 self._update(key, total=total)
@@ -722,6 +723,9 @@ class DownloadManager:
             if total and done != total:
                 raise IOError(f"下载不完整：{done} / {total} 字节")
             os.replace(partial, target)
+            if after:
+                self._update(key, status="converting")
+                after()
             self._update(key, status="done", downloaded=done)
         except Exception as exc:  # noqa: BLE001 - 把任何失败原因都告诉前端
             partial.unlink(missing_ok=True)

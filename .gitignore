@@ -17,6 +17,9 @@ logs/
 outputs/
 models/
 
+# 姿势参考库：图片版权归原作者，不再分发（运行 scripts/download_poses.py 或在网页上下载）
+poses/
+
 # Model and adapter weights
 *.safetensors
 *.ckpt
