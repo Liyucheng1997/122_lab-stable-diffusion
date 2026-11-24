@@ -413,7 +413,9 @@ def _store_init_image(raw: str) -> Path:
 
 @app.get("/")
 def index() -> FileResponse:
-    return FileResponse(STATIC_DIR / "index.html")
+    # 首页每次都要向服务器确认：不然桌面版的 WebView2 会按修改时间自己估一个缓存期，
+    # 更新代码后重开窗口还是旧页面（旧页面又引用旧版本号的 app.js / styles.css）
+    return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/api/status")
